@@ -141,6 +141,7 @@ httpx = ">=0.23"
 confluent-kafka = ">=2.0"
 neo4j = ">=5.9"
 pulsar-client = ">=3.3"
+rocketmq-client-python = ">=2.0.0"
 grpcio = ">=1.49"
 
 [tool.poetry.group.lint]
