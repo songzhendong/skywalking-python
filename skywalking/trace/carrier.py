@@ -56,8 +56,11 @@ class Carrier(CarrierItem):
         self.service_instance = service_instance  # type: str
         self.endpoint = endpoint  # type: str
         self.client_address = client_address  # type: str
+        self.extension_context = ExtensionContext()
         self.correlation_carrier = SW8CorrelationCarrier()
-        self.items = [self.correlation_carrier, self]  # type: List[CarrierItem]
+        self.extension_carrier = SW8ExtensionCarrier(self.extension_context)
+        self.items = [self.correlation_carrier, self.extension_carrier, self]  # type: List[CarrierItem]
+        self.omit_empty_items = False  # type: bool
         self.__iter_index = 0  # type: int
         if correlation is not None:
             self.correlation_carrier.correlation = correlation
@@ -111,11 +114,13 @@ class Carrier(CarrierItem):
         return self
 
     def __next__(self):
-        if self.__iter_index >= len(self.items):
-            raise StopIteration
-        n = self.items[self.__iter_index]
-        self.__iter_index += 1
-        return n
+        while self.__iter_index < len(self.items):
+            n = self.items[self.__iter_index]
+            self.__iter_index += 1
+            if self.omit_empty_items and not n.val:
+                continue
+            return n
+        raise StopIteration
 
 
 class SW8CorrelationCarrier(CarrierItem):
@@ -145,3 +150,60 @@ class SW8CorrelationCarrier(CarrierItem):
             if len(parts) != 2:
                 continue
             self.correlation[b64decode(parts[0])] = b64decode(parts[1])
+
+
+class ExtensionContext:
+    """Optional SW8 extension fields (sw8-x), aligned with Java ExtensionContext."""
+
+    def __init__(self):
+        self.skip_analysis = False
+        self.sending_timestamp = None  # type: int | None
+
+    def serialize(self) -> str:
+        prefix = '1' if self.skip_analysis else '0'
+        ts = self.sending_timestamp if self.sending_timestamp is not None else ' '
+        return f'{prefix}-{ts}'
+
+    def deserialize(self, value: str) -> None:
+        if not value:
+            return
+        parts = value.split('-', 1)
+        if parts:
+            self.skip_analysis = parts[0] == '1'
+        if len(parts) > 1 and parts[1].strip():
+            try:
+                self.sending_timestamp = int(parts[1].strip())
+            except ValueError:
+                pass
+
+    def inject_sending_timestamp(self) -> None:
+        from skywalking.utils.time import current_milli_time
+        self.sending_timestamp = current_milli_time()
+
+    def handle(self, span) -> None:
+        if self.sending_timestamp is not None:
+            from skywalking.utils.time import current_milli_time
+            from skywalking.trace.tags import TagTransmissionLatency
+            latency = current_milli_time() - self.sending_timestamp
+            span.tag(TagTransmissionLatency(str(latency)))
+
+
+class SW8ExtensionCarrier(CarrierItem):
+    def __init__(self, extension_context: ExtensionContext):
+        self.extension_context = extension_context
+        CarrierItem.__init__(self, key='sw8-x', val='')
+
+    @property
+    def val(self) -> str:
+        ctx = self.extension_context
+        if ctx.sending_timestamp is None and not ctx.skip_analysis:
+            return ''
+        if ctx.sending_timestamp is None:
+            return ''
+        return ctx.serialize()
+
+    @val.setter
+    def val(self, value: str) -> None:
+        CarrierItem.val.fset(self, value)
+        if value:
+            self.extension_context.deserialize(value)

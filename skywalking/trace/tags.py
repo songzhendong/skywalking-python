@@ -92,6 +92,14 @@ class TagMqQueue(Tag):
     key = 'mq.queue'
 
 
+class TagMqMessageKeys(Tag):
+    key = 'mq.message.keys'
+
+
+class TagMqMessageTags(Tag):
+    key = 'mq.message.tags'
+
+
 class TagCeleryParameters(Tag):
     key = 'celery.parameters'
 
@@ -106,3 +114,11 @@ class TagGrpcUrl(Tag):
 
 class TagGrpcStatusCode(Tag):
     key = 'grpc.status_code'
+
+
+class TagTransmissionLatency(Tag):
+    key = 'transmission.latency'
+
+
+class TagMqStatus(Tag):
+    key = 'mq.status'

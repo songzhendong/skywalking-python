@@ -32,6 +32,8 @@ class Component(Enum):
     Redis = 7
     MongoDB = 9
     PostgreSQL = 22
+    RocketMQProducer = 38
+    RocketMQConsumer = 39
     KafkaProducer = 40
     KafkaConsumer = 41
     RabbitmqProducer = 52

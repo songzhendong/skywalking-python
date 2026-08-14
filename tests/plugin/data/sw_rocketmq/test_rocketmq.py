@@ -1,3 +1,4 @@
+
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
 # this work for additional information regarding copyright ownership.
@@ -12,18 +13,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+from typing import Callable
 
-ARG BASE_PYTHON_IMAGE
+import pytest
+import requests
 
-FROM python:${BASE_PYTHON_IMAGE}
+from skywalking.plugins.sw_rocketmq import support_matrix
+from tests.orchestrator import get_test_vector
+from tests.plugin.base import TestPluginBase
 
-WORKDIR /agent
 
-COPY . /agent
+@pytest.fixture
+def prepare():
+    # type: () -> Callable
+    def _run(*_):
+        import time
+        requests.get('http://0.0.0.0:9090/users', timeout=5)
+        requests.get('http://0.0.0.0:9090/transaction', timeout=5)
+        time.sleep(25)
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential procps wget \
-    && wget -q https://archive.apache.org/dist/rocketmq/rocketmq-client-cpp/2.0.0/rocketmq-client-cpp-2.0.0.amd64.deb \
-    && (dpkg -i rocketmq-client-cpp-2.0.0.amd64.deb || apt-get install -f -y) \
-    && rm -f rocketmq-client-cpp-2.0.0.amd64.deb \
-    && cd /agent && make install \
+    return _run
+
+
+class TestPlugin(TestPluginBase):
+    @pytest.mark.parametrize('version', get_test_vector(lib_name='rocketmq-client-python', support_matrix=support_matrix))
+    def test_plugin(self, docker_compose, version):
+        self.validate()

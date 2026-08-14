@@ -1,3 +1,4 @@
+
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
 # this work for additional information regarding copyright ownership.
@@ -12,18 +13,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
-ARG BASE_PYTHON_IMAGE
+if __name__ == '__main__':
+    from flask import Flask, jsonify
+    from rocketmq.client import Producer, Message
 
-FROM python:${BASE_PYTHON_IMAGE}
+    TOPIC = 'TopicReconsume'
+    NAMESRV = 'namesrv:9876'
 
-WORKDIR /agent
+    app = Flask(__name__)
+    producer = Producer('PID-reconsume')
+    producer.set_name_server_address(NAMESRV)
+    producer.start()
 
-COPY . /agent
+    @app.route('/users', methods=['POST', 'GET'])
+    def application():
+        msg = Message(TOPIC)
+        msg.set_body('reconsume-later')
+        producer.send_sync(msg)
+        return jsonify({'status': 'ok'})
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential procps wget \
-    && wget -q https://archive.apache.org/dist/rocketmq/rocketmq-client-cpp/2.0.0/rocketmq-client-cpp-2.0.0.amd64.deb \
-    && (dpkg -i rocketmq-client-cpp-2.0.0.amd64.deb || apt-get install -f -y) \
-    && rm -f rocketmq-client-cpp-2.0.0.amd64.deb \
-    && cd /agent && make install \
+    PORT = 9090
+    app.run(host='0.0.0.0', port=PORT, debug=False)

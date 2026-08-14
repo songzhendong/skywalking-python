@@ -166,8 +166,10 @@ class SpanContext:
         else:
             span = self.new_span(parent, EntrySpan, op=op)
 
-            if carrier is not None and carrier.is_valid:  # TODO: should this be done irrespective of inheritance?
-                span.extract(carrier=carrier)
+            if carrier is not None:
+                span._extension_context = carrier.extension_context
+                if carrier.is_valid:  # TODO: should this be done irrespective of inheritance?
+                    span.extract(carrier=carrier)
 
         return span
 

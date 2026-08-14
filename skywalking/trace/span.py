@@ -183,6 +183,9 @@ class EntrySpan(Span):
         self.layer = Layer.Unknown
         self.logs = []
         self.tags = defaultdict(list)
+        ext = getattr(self, '_extension_context', None)
+        if ext:
+            ext.handle(self)
 
 
 @tostring
@@ -210,7 +213,7 @@ class ExitSpan(Span):
         )
 
     def inject(self) -> 'Carrier':
-        return Carrier(
+        carrier = Carrier(
             trace_id=str(self.context.segment.related_traces[0]),
             segment_id=str(self.context.segment.segment_id),
             span_id=str(self.sid),
@@ -220,6 +223,8 @@ class ExitSpan(Span):
             client_address=self.peer,
             correlation=self.context._correlation,
         )
+        carrier.omit_empty_items = True
+        return carrier
 
 
 @tostring
