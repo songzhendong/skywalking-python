@@ -20,9 +20,10 @@ import atexit
 import functools
 import os
 import sys
-from queue import Full, Queue
+import time
+from queue import Empty, Full, Queue
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from skywalking import config, loggings, meter, plugins, profile, sampling
 from skywalking.agent.protocol import Protocol, ProtocolAsync
@@ -32,6 +33,7 @@ from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
 from skywalking.protocol.language_agent.Meter_pb2 import MeterData
 from skywalking.protocol.logging.Logging_pb2 import LogData
+from skywalking.utils.grpc_channel import log_dropped_throttled, log_reporter_exception_throttled
 from skywalking.utils.singleton import Singleton
 
 if TYPE_CHECKING:
@@ -40,6 +42,164 @@ if TYPE_CHECKING:
 if config.agent_asyncio_enhancement:
     import uvloop
     uvloop.install()
+
+# Shutdown must never block the host indefinitely (Node flush budget parity).
+_SHUTDOWN_FLUSH_TIMEOUT_SEC = 2.0
+_SHUTDOWN_JOIN_TIMEOUT_SEC = 2.0
+_SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC = 3.0
+
+
+def _abandon_sync_queue(q: Queue) -> int:
+    """Drop queued items and balance unfinished_tasks so Queue.join() can finish."""
+    abandoned = 0
+    while True:
+        try:
+            q.get_nowait()
+            q.task_done()
+            abandoned += 1
+        except Empty:
+            break
+    return abandoned
+
+
+def _join_sync_queue(q: Queue, timeout: float) -> bool:
+    """Return True if join completed within timeout."""
+    done = Event()
+
+    def _wait():
+        q.join()
+        done.set()
+
+    Thread(target=_wait, name='sw-queue-join', daemon=True).start()
+    return done.wait(timeout)
+
+
+def _shutdown_sync_queue(
+    report_fn: Optional[Callable[[], None]],
+    q: Queue,
+    label: str,
+    *,
+    may_send: bool,
+) -> None:
+    """
+    Best-effort shutdown drain: optional timed flush when READY, then abandon + timed join.
+    Never blocks longer than flush+join budgets (prevents atexit hang when not READY).
+    """
+    if may_send and report_fn is not None and not q.empty():
+        done = Event()
+
+        def _flush():
+            try:
+                report_fn()
+            except Exception:  # noqa: BLE001 - shutdown must continue
+                logger.exception('shutdown flush failed for %s queue', label)
+            finally:
+                done.set()
+
+        Thread(target=_flush, name=f'sw-shutdown-flush-{label}', daemon=True).start()
+        if not done.wait(_SHUTDOWN_FLUSH_TIMEOUT_SEC):
+            logger.warning(
+                'shutdown flush timed out after %.1fs for %s queue; abandoning remainder',
+                _SHUTDOWN_FLUSH_TIMEOUT_SEC,
+                label,
+            )
+
+    abandoned = _abandon_sync_queue(q)
+    if abandoned:
+        log_dropped_throttled(label, abandoned, force=True)
+
+    if not _join_sync_queue(q, _SHUTDOWN_JOIN_TIMEOUT_SEC):
+        logger.warning(
+            'shutdown join timed out after %.1fs for %s queue (unfinished_tasks=%s)',
+            _SHUTDOWN_JOIN_TIMEOUT_SEC,
+            label,
+            getattr(q, 'unfinished_tasks', '?'),
+        )
+
+
+async def _abandon_async_queue(q: asyncio.Queue) -> int:
+    abandoned = 0
+    while True:
+        try:
+            q.get_nowait()
+            q.task_done()
+            abandoned += 1
+        except asyncio.QueueEmpty:
+            break
+    return abandoned
+
+
+async def _shutdown_async_queue(q: asyncio.Queue, label: str) -> None:
+    """
+    Async reporters use unbounded queue.get() generators — do not await report() on
+    shutdown (can hang forever). Abandon + timed join, then caller cancels tasks.
+    """
+    abandoned = await _abandon_async_queue(q)
+    if abandoned:
+        log_dropped_throttled(label, abandoned, force=True)
+    try:
+        await asyncio.wait_for(q.join(), timeout=_SHUTDOWN_JOIN_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        logger.warning(
+            'shutdown join timed out after %.1fs for async %s queue',
+            _SHUTDOWN_JOIN_TIMEOUT_SEC,
+            label,
+        )
+
+
+async def _cancel_pending_tasks(loop) -> None:
+    """
+    Cancel every task on the agent loop except the caller. The current task must be
+    excluded from the gather too, otherwise it would await itself and never return.
+    """
+    current = asyncio.current_task(loop)
+    pending = [task for task in asyncio.all_tasks(loop) if task is not current]
+    if not pending:
+        return
+    for task in pending:
+        task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=_SHUTDOWN_JOIN_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            'shutdown task cancellation timed out after %.1fs; %d task(s) still pending',
+            _SHUTDOWN_JOIN_TIMEOUT_SEC,
+            sum(1 for task in pending if not task.done()),
+        )
+
+
+def _close_previous_protocol(protocol) -> None:
+    """Close a replaced protocol channel (fork re-bootstrap / defensive re-open)."""
+    if protocol is None:
+        return
+    close = getattr(protocol, 'close', None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            logger.exception('failed to close previous protocol channel')
+
+
+async def _aclose_previous_protocol(protocol) -> None:
+    """Await aclose on the running loop. Never run_coroutine_threadsafe().result() here."""
+    if protocol is None:
+        return
+    aclose = getattr(protocol, 'aclose', None)
+    if callable(aclose):
+        try:
+            await aclose()
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception('failed to aclose previous protocol channel')
+    close = getattr(protocol, 'close', None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            logger.exception('failed to close previous protocol channel')
 
 
 def report_with_backoff(reporter_name, init_wait):
@@ -59,8 +219,7 @@ def report_with_backoff(reporter_name, init_wait):
                     wait = 0 if flag else base
                 except Exception:  # noqa
                     wait = min(60, wait * 2 or 1)  # double wait time with each consecutive error up to a maximum
-                    logger.exception(f'Exception in {reporter_name} service in pid {os.getpid()}, '
-                                     f'retry in {wait} seconds')
+                    log_reporter_exception_throttled(reporter_name, wait)
                 self._finished.wait(wait)
             logger.info('finished reporter thread')
 
@@ -86,9 +245,16 @@ def report_with_backoff_async(reporter_name, init_wait):
                     wait = 0 if flag else base
                 except Exception:  # noqa
                     wait = min(60, wait * 2 or 1)  # double wait time with each consecutive error up to a maximum
-                    logger.exception(f'Exception in {reporter_name} service in pid {os.getpid()}, '
-                                     f'retry in {wait} seconds')
-                await asyncio.sleep(wait)
+                    log_reporter_exception_throttled(reporter_name, wait)
+                # Prefer Event.wait so shutdown (_finished.set) wakes immediately;
+                # plain sleep(wait) would otherwise block up to heartbeat/backoff period.
+                if wait:
+                    try:
+                        await asyncio.wait_for(self._finished.wait(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(0)
             logger.info('finished reporter coroutine')
 
         return backoff_wrapper
@@ -126,12 +292,15 @@ class SkyWalkingAgent(Singleton):
 
         if config.agent_protocol == 'grpc':
             from skywalking.agent.protocol.grpc import GrpcProtocol
+            _close_previous_protocol(self.__protocol)
             self.__protocol = GrpcProtocol()
         elif config.agent_protocol == 'http':
             from skywalking.agent.protocol.http import HttpProtocol
+            _close_previous_protocol(self.__protocol)
             self.__protocol = HttpProtocol()
         elif config.agent_protocol == 'kafka':
             from skywalking.agent.protocol.kafka import KafkaProtocol
+            _close_previous_protocol(self.__protocol)
             self.__protocol = KafkaProtocol()
 
         # Start reporter threads and register queues
@@ -373,25 +542,51 @@ class SkyWalkingAgent(Singleton):
         """
         This method is called when the agent is shutting down.
         Clean up all the queues and threads.
+
+        Stop reporter loops first, then best-effort flush (timed) when READY, else
+        abandon queued items so Queue.join() cannot hang forever (READY-gate gap).
         """
         if not self.__reporting:  # never bootstrapped in this process (e.g. pre-fork master)
             return
-        self.__protocol.report_segment(self.__segment_queue, False)
-        self.__segment_queue.join()
+
+        # Wake backoff loops immediately; do not leave finished.set() until after joins.
+        self._finished.set()
+        may_send = self.__protocol.is_ready()
+
+        _shutdown_sync_queue(
+            (lambda: self.__protocol.report_segment(self.__segment_queue, False)) if may_send else None,
+            self.__segment_queue,
+            'segment',
+            may_send=may_send,
+        )
 
         if config.agent_log_reporter_active:
-            self.__protocol.report_log(self.__log_queue, False)
-            self.__log_queue.join()
+            _shutdown_sync_queue(
+                (lambda: self.__protocol.report_log(self.__log_queue, False)) if may_send else None,
+                self.__log_queue,
+                'log',
+                may_send=may_send,
+            )
 
         if config.agent_profile_active:
-            self.__protocol.report_snapshot(self.__snapshot_queue, False)
-            self.__snapshot_queue.join()
+            _shutdown_sync_queue(
+                (lambda: self.__protocol.report_snapshot(self.__snapshot_queue, False)) if may_send else None,
+                self.__snapshot_queue,
+                'snapshot',
+                may_send=may_send,
+            )
 
         if config.agent_meter_reporter_active:
-            self.__protocol.report_meter(self.__meter_queue, False)
-            self.__meter_queue.join()
+            _shutdown_sync_queue(
+                (lambda: self.__protocol.report_meter(self.__meter_queue, False)) if may_send else None,
+                self.__meter_queue,
+                'meter',
+                may_send=may_send,
+            )
 
-        self._finished.set()
+        close = getattr(self.__protocol, 'close', None)
+        if callable(close):
+            close()
 
     def stop(self) -> None:
         """
@@ -404,15 +599,24 @@ class SkyWalkingAgent(Singleton):
         self.__started = False
 
     @report_with_backoff(reporter_name='heartbeat', init_wait=config.agent_collector_heartbeat_period)
-    def __heartbeat(self) -> None:
+    def __heartbeat(self) -> bool:
+        # Until subscribe reports READY, retry soon (do not wait a full heartbeat period).
+        if not self.__protocol.is_ready():
+            time.sleep(0.5)
+            return True
         self.__protocol.heartbeat()
+        return False
 
     # segment/log init_wait is set to 0.02 to prevent threads from hogging the cpu too much
     # The value of 0.02(20 ms) is set to be consistent with the queue delay of the Java agent
 
     @report_with_backoff(reporter_name='segment', init_wait=0.02)
     def __report_segment(self) -> bool:
-        """Returns True if the queue is not empty"""
+        """Returns True if the queue is not empty and a send was attempted."""
+        # Not READY: sleep then wait=0 — avoid 20ms busy-loop + IDLE nudge thrash.
+        if not self.__protocol.is_ready():
+            time.sleep(0.5)
+            return True
         queue_not_empty_flag = not self.__segment_queue.empty()
         if queue_not_empty_flag:
             self.__protocol.report_segment(self.__segment_queue)
@@ -420,7 +624,10 @@ class SkyWalkingAgent(Singleton):
 
     @report_with_backoff(reporter_name='log', init_wait=0.02)
     def __report_log(self) -> bool:
-        """Returns True if the queue is not empty"""
+        """Returns True if the queue is not empty and a send was attempted."""
+        if not self.__protocol.is_ready():
+            time.sleep(0.5)
+            return True
         queue_not_empty_flag = not self.__log_queue.empty()
         if queue_not_empty_flag:
             self.__protocol.report_log(self.__log_queue)
@@ -428,11 +635,17 @@ class SkyWalkingAgent(Singleton):
 
     @report_with_backoff(reporter_name='meter', init_wait=config.agent_meter_reporter_period)
     def __report_meter(self) -> None:
+        if not self.__protocol.is_ready():
+            time.sleep(0.5)
+            return
         if not self.__meter_queue.empty():
             self.__protocol.report_meter(self.__meter_queue)
 
     @report_with_backoff(reporter_name='profile_snapshot', init_wait=0.5)
     def __send_profile_snapshot(self) -> None:
+        if not self.__protocol.is_ready():
+            time.sleep(0.5)
+            return
         if not self.__snapshot_queue.empty():
             self.__protocol.report_snapshot(self.__snapshot_queue)
 
@@ -464,7 +677,7 @@ class SkyWalkingAgent(Singleton):
         try:  # unlike checking __queue.full() then inserting, this is atomic
             self.__segment_queue.put(segment, block=False)
         except Full:
-            logger.warning('the queue is full, the segment will be abandoned')
+            log_dropped_throttled('segment')
 
     def archive_log(self, log_data: 'LogData'):
         if not self.__reporting:
@@ -472,7 +685,7 @@ class SkyWalkingAgent(Singleton):
         try:
             self.__log_queue.put(log_data, block=False)
         except Full:
-            logger.warning('the queue is full, the log will be abandoned')
+            log_dropped_throttled('log')
 
     def archive_meter(self, meter_data: 'MeterData'):
         if not self.__reporting:
@@ -480,15 +693,15 @@ class SkyWalkingAgent(Singleton):
         try:
             self.__meter_queue.put(meter_data, block=False)
         except Full:
-            logger.warning('the queue is full, the meter will be abandoned')
+            log_dropped_throttled('meter')
 
     def add_profiling_snapshot(self, snapshot: TracingThreadSnapshot):
         if not self.__reporting:
             return
         try:
-            self.__snapshot_queue.put(snapshot)
+            self.__snapshot_queue.put_nowait(snapshot)
         except Full:
-            logger.warning('the snapshot queue is full, the snapshot will be abandoned')
+            log_dropped_throttled('snapshot')
 
     def notify_profile_finish(self, task: ProfileTask):
         try:
@@ -516,7 +729,8 @@ class SkyWalkingAgentAsync(Singleton):
 
         self.event_loop_thread: Optional[Thread] = None
 
-    def __bootstrap(self):
+    async def __bootstrap(self):
+        await _aclose_previous_protocol(self.__protocol)
         if config.agent_protocol == 'grpc':
             from skywalking.agent.protocol.grpc_aio import GrpcProtocolAsync
             self.__protocol = GrpcProtocolAsync()
@@ -543,6 +757,10 @@ class SkyWalkingAgentAsync(Singleton):
         """
 
         self.background_coroutines = set()
+
+        watch = getattr(self.__protocol, 'watch_connectivity', None)
+        if callable(watch):
+            self.background_coroutines.add(watch())
 
         self.background_coroutines.add(self.__heartbeat())
         self.background_coroutines.add(self.__report_segment())
@@ -594,7 +812,7 @@ class SkyWalkingAgentAsync(Singleton):
         if config.sample_n_per_3_secs > 0:
             await sampling.init_async()
 
-        self.__bootstrap()  # gather all coroutines
+        await self.__bootstrap()  # gather all coroutines
 
         logger.debug('All background coroutines started')
         await asyncio.gather(*self.background_coroutines)
@@ -649,31 +867,53 @@ class SkyWalkingAgentAsync(Singleton):
         """
         This method is called when the agent is shutting down.
         Clean up all the queues and stop all the asyncio tasks.
+
+        Do not await report_* here: aio generators use unbounded queue.get() and can
+        hang forever. Abandon + timed join, then cancel tasks.
         """
         if self._finished is not None:
             self._finished.set()
-        queue_join_coroutine_list = [self.__segment_queue.join()]
+
+        await _shutdown_async_queue(self.__segment_queue, 'segment')
 
         if config.agent_log_reporter_active:
-            queue_join_coroutine_list.append(self.__log_queue.join())
+            await _shutdown_async_queue(self.__log_queue, 'log')
 
         if config.agent_profile_active:
-            queue_join_coroutine_list.append(self.__snapshot_queue.join())
+            await _shutdown_async_queue(self.__snapshot_queue, 'snapshot')
 
         if config.agent_meter_reporter_active:
-            queue_join_coroutine_list.append(self.__meter_queue.join())
+            await _shutdown_async_queue(self.__meter_queue, 'meter')
 
-        await asyncio.gather(*queue_join_coroutine_list, return_exceptions=True)    # clean queues
-        # cancel all tasks
-        all_tasks = asyncio.all_tasks(self.loop)
-        for task in all_tasks:
-            task.cancel()
+        await _cancel_pending_tasks(self.loop)
+
+        aclose = getattr(self.__protocol, 'aclose', None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            close = getattr(self.__protocol, 'close', None)
+            if callable(close):
+                close()
 
     def __fini(self):
         if not self.loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self.__fini_async(), self.loop)
-        self.event_loop_thread.join()
-        logger.info('Finished Python agent event_loop thread')
+            future = asyncio.run_coroutine_threadsafe(self.__fini_async(), self.loop)
+            try:
+                future.result(timeout=_SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC + _SHUTDOWN_JOIN_TIMEOUT_SEC * 4)
+            except Exception:  # noqa: BLE001 - never block process exit on shutdown
+                logger.exception('async agent shutdown exceeded budget or failed')
+                future.cancel()
+        self.event_loop_thread.join(timeout=_SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC)
+        if self.event_loop_thread.is_alive():
+            logger.warning(
+                'Python agent event_loop thread still alive after %.1fs shutdown budget',
+                _SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC,
+            )
+        else:
+            logger.info('Finished Python agent event_loop thread')
         # TODO: Unhandled error in sys.excepthook https://github.com/pytest-dev/execnet/issues/30
 
     def stop(self) -> None:
@@ -685,12 +925,19 @@ class SkyWalkingAgentAsync(Singleton):
         self.__started = False
 
     @report_with_backoff_async(reporter_name='heartbeat', init_wait=config.agent_collector_heartbeat_period)
-    async def __heartbeat(self) -> None:
+    async def __heartbeat(self) -> bool:
+        if not self.__protocol.is_ready():
+            await asyncio.sleep(0.5)
+            return True
         await self.__protocol.heartbeat()
+        return False
 
     @report_with_backoff_async(reporter_name='segment', init_wait=0.02)
     async def __report_segment(self) -> bool:
-        """Returns True if the queue is not empty"""
+        """Returns True if the queue is not empty and a send was attempted."""
+        if not self.__protocol.is_ready():
+            await asyncio.sleep(0.5)
+            return True
         queue_not_empty_flag = not self.__segment_queue.empty()
         if queue_not_empty_flag:
             await self.__protocol.report_segment(self.__segment_queue)
@@ -698,7 +945,10 @@ class SkyWalkingAgentAsync(Singleton):
 
     @report_with_backoff_async(reporter_name='log', init_wait=0.02)
     async def __report_log(self) -> bool:
-        """Returns True if the queue is not empty"""
+        """Returns True if the queue is not empty and a send was attempted."""
+        if not self.__protocol.is_ready():
+            await asyncio.sleep(0.5)
+            return True
         queue_not_empty_flag = not self.__log_queue.empty()
         if queue_not_empty_flag:
             await self.__protocol.report_log(self.__log_queue)
@@ -706,11 +956,17 @@ class SkyWalkingAgentAsync(Singleton):
 
     @report_with_backoff_async(reporter_name='meter', init_wait=config.agent_meter_reporter_period)
     async def __report_meter(self) -> None:
+        if not self.__protocol.is_ready():
+            await asyncio.sleep(0.5)
+            return
         if not self.__meter_queue.empty():
             await self.__protocol.report_meter(self.__meter_queue)
 
     @report_with_backoff_async(reporter_name='profile_snapshot', init_wait=0.5)
     async def __send_profile_snapshot(self) -> None:
+        if not self.__protocol.is_ready():
+            await asyncio.sleep(0.5)
+            return
         if not self.__snapshot_queue.empty():
             await self.__protocol.report_snapshot(self.__snapshot_queue)
 
@@ -729,7 +985,7 @@ class SkyWalkingAgentAsync(Singleton):
         try:
             q.put_nowait(item)
         except asyncio.QueueFull:
-            logger.warning(f'the {queue_name} queue is full, the item will be abandoned')
+            log_dropped_throttled(queue_name)
 
     def is_segment_queue_full(self):
         return self.__segment_queue.full()
@@ -750,7 +1006,7 @@ class SkyWalkingAgentAsync(Singleton):
         try:
             self.__meter_queue.put_nowait(meter_data)
         except asyncio.QueueFull:
-            logger.warning('the meter queue is full, the item will be abandoned')
+            log_dropped_throttled('meter')
 
     def add_profiling_snapshot(self, snapshot: TracingThreadSnapshot):
         self.loop.call_soon_threadsafe(self.__asyncio_queue_put_nowait, self.__snapshot_queue, 'snapshot', snapshot)

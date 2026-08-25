@@ -55,7 +55,11 @@ def setup_skywalking():
     """
     config.agent_instance_name = f'{config.agent_instance_name}-child({os.getpid()})'
 
-    agent.start()
+    try:
+        agent.start()
+    except Exception:  # noqa: BLE001 - never crash the uWSGI worker (sitecustomize parity)
+        logger.exception('SkyWalking agent failed to start in uWSGI worker PID-%s', os.getpid())
+        return
     # append pid-suffix to instance name
     logger.info(f'Apache SkyWalking Python agent started in pre-forked worker process PID-{os.getpid()}. '
                 f'Service {config.agent_name}, instance name: {config.agent_instance_name}')

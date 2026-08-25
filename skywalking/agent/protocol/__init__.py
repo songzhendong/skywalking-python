@@ -21,6 +21,13 @@ from asyncio import Queue as QueueAsync
 
 
 class Protocol(ABC):
+    def is_ready(self) -> bool:
+        """
+        Whether the reporter may send RPCs this tick.
+        gRPC overrides with channel READY gate; HTTP/Kafka stay always-ready.
+        """
+        return True
+
     @abstractmethod
     def heartbeat(self):
         raise NotImplementedError()
@@ -51,6 +58,10 @@ class Protocol(ABC):
 
 
 class ProtocolAsync(ABC):
+    def is_ready(self) -> bool:
+        """See Protocol.is_ready — gRPC aio overrides with channel READY gate."""
+        return True
+
     @abstractmethod
     async def heartbeat(self):
         raise NotImplementedError()

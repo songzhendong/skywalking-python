@@ -28,6 +28,13 @@ from skywalking.agent.protocol.interceptors import header_adder_interceptor
 from skywalking.client.grpc import GrpcServiceManagementClient, GrpcTraceSegmentReportService, \
     GrpcProfileTaskChannelService, GrpcLogDataReportService, GrpcMeterReportService
 from skywalking.loggings import logger, logger_debug_enabled
+from skywalking.utils.grpc_channel import (
+    apply_connectivity_transition,
+    create_sync_channel,
+    handle_rpc_error,
+    is_channel_ready,
+    log_dropped_throttled,
+)
 from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
 from skywalking.protocol.common.Common_pb2 import KeyStringValuePair
@@ -43,58 +50,108 @@ class GrpcProtocol(Protocol):
         self.properties_sent = False
         self.state = None
 
-        if config.agent_force_tls:
-            self.channel = grpc.secure_channel(config.agent_collector_backend_services, grpc.ssl_channel_credentials())
-        else:
-            self.channel = grpc.insecure_channel(config.agent_collector_backend_services)
+        # One channel for process lifetime; multi-address failover via gRPC pick_first.
+        self.channel = create_sync_channel()
 
         if config.agent_authentication:
             self.channel = grpc.intercept_channel(
                 self.channel, header_adder_interceptor('authentication', config.agent_authentication)
             )
 
-        self.channel.subscribe(self._cb, try_to_connect=True)
         self.service_management = GrpcServiceManagementClient(self.channel)
         self.traces_reporter = GrpcTraceSegmentReportService(self.channel)
         self.profile_channel = GrpcProfileTaskChannelService(self.channel)
         self.log_reporter = GrpcLogDataReportService(self.channel)
         self.meter_reporter = GrpcMeterReportService(self.channel)
 
+        # Subscribe last: _cb runs on a grpc thread and touches service_management.
+        self.channel.subscribe(self._cb, try_to_connect=True)
+
+    def is_ready(self) -> bool:
+        """
+        Node CONNECTED ≈ subscribe-watched gRPC READY.
+
+        Sync grpcio has no Channel.get_state(); check_connectivity_state can disagree
+        with subscribe callbacks on some builds and permanently skipped all RPCs in
+        E2E (channel already READY via subscribe, reporters still gated). Use the
+        watched state as source of truth; only nudge C-core when IDLE.
+        """
+        if self.state == grpc.ChannelConnectivity.READY:
+            return True
+        if self.state == grpc.ChannelConnectivity.IDLE:
+            # Side-effect nudge (ignore return); subscribe callback updates self.state.
+            is_channel_ready(self.channel)
+        return self.state == grpc.ChannelConnectivity.READY
+
     def _cb(self, state):
+        prev = self.state
         if logger_debug_enabled:
-            logger.debug('grpc channel connectivity changed, [%s -> %s]', self.state, state)
+            logger.debug('grpc channel connectivity changed, [%s -> %s]', prev, state)
+        try:
+            apply_connectivity_transition(prev, state)
+            # Independent OAPs need properties re-registered after failover.
+            # Immediate send via properties_sent; periodic refresh covers silent READY switches.
+            if prev == grpc.ChannelConnectivity.READY and state != grpc.ChannelConnectivity.READY:
+                self.properties_sent = False
+                self.service_management.sent_properties_counter = 0
+        except Exception:  # noqa: BLE001 - never let grpc's connectivity thread die on us
+            logger.exception('failed to handle grpc connectivity transition')
         self.state = state
 
     def query_profile_commands(self):
+        if not self.is_ready():
+            return
         if logger_debug_enabled:
             logger.debug('query profile commands')
         self.profile_channel.do_query()
 
     def notify_profile_task_finish(self, task: ProfileTask):
+        if not self.is_ready():
+            return
         self.profile_channel.finish(task)
 
     def heartbeat(self):
-        try:
-            if not self.properties_sent:
+        if not self.is_ready():
+            return
+        if not self.properties_sent:
+            try:
                 self.service_management.send_instance_props()
                 self.properties_sent = True
-
+            except grpc.RpcError as e:
+                handle_rpc_error(e, self.on_error)
+        try:
             self.service_management.send_heart_beat()
-
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            handle_rpc_error(e, self.on_error)
             raise
 
     def on_error(self):
+        # Re-subscribe the same channel only — never rebuild or rotate backends here.
+        # DEADLINE_EXCEEDED on READY is not a connectivity failure; see handle_rpc_error.
         traceback.print_exc() if logger.isEnabledFor(logging.DEBUG) else None
         self.channel.unsubscribe(self._cb)
         self.channel.subscribe(self._cb, try_to_connect=True)
 
+    def close(self):
+        """Best-effort channel teardown on agent stop (Node shutdownNow parity)."""
+        try:
+            self.channel.unsubscribe(self._cb)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.channel.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def report_segment(self, queue: Queue, block: bool = True):
+        # Gate before dequeue so disconnect windows keep segments in the queue (Node buffer parity).
+        if not self.is_ready():
+            return
         start = None
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal start, sent
 
             while True:
                 try:
@@ -110,6 +167,7 @@ class GrpcProtocol(Protocol):
                     return
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('reporting segment %s', segment)
@@ -156,15 +214,20 @@ class GrpcProtocol(Protocol):
 
         try:
             self.traces_reporter.report(generator())
-        except grpc.RpcError:
-            self.on_error()
-            raise  # reraise so that incremental reconnect wait can process
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('segment', sent)
+            handle_rpc_error(e, self.on_error)
+            raise  # reraise so that incremental reconnect wait can process; failed batch discarded
 
     def report_log(self, queue: Queue, block: bool = True):
+        if not self.is_ready():
+            return
         start = None
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal start, sent
 
             while True:
                 try:
@@ -180,6 +243,7 @@ class GrpcProtocol(Protocol):
                     return
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('Reporting Log')
@@ -188,15 +252,20 @@ class GrpcProtocol(Protocol):
 
         try:
             self.log_reporter.report(generator())
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('log', sent)
+            handle_rpc_error(e, self.on_error)
             raise
 
     def report_meter(self, queue: Queue, block: bool = True):
+        if not self.is_ready():
+            return
         start = None
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal start, sent
 
             while True:
                 try:
@@ -212,6 +281,7 @@ class GrpcProtocol(Protocol):
                     return
 
                 queue.task_done()
+                sent += 1
 
                 yield meter_data
 
@@ -219,15 +289,20 @@ class GrpcProtocol(Protocol):
             if logger_debug_enabled:
                 logger.debug('Reporting Meter')
             self.meter_reporter.report(generator())
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('meter', sent)
+            handle_rpc_error(e, self.on_error)
             raise
 
     def report_snapshot(self, queue: Queue, block: bool = True):
+        if not self.is_ready():
+            return
         start = None
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal start, sent
 
             while True:
                 try:
@@ -243,6 +318,7 @@ class GrpcProtocol(Protocol):
                     return
 
                 queue.task_done()
+                sent += 1
 
                 transform_snapshot = ThreadSnapshot(
                     taskId=str(snapshot.task_id),
@@ -256,6 +332,8 @@ class GrpcProtocol(Protocol):
 
         try:
             self.profile_channel.report(generator())
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('snapshot', sent)
+            handle_rpc_error(e, self.on_error)
             raise
