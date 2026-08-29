@@ -25,6 +25,7 @@ import grpc
 
 from skywalking.utils.grpc_channel import (
     GRPC_CHANNEL_OPTIONS,
+    _GRPC_RPC_TIMEOUT_MARGIN_SEC,
     AddressKind,
     BackendAddress,
     build_grpc_target,
@@ -372,7 +373,7 @@ class TestReadyGate(unittest.TestCase):
 class TestLogThrottle(unittest.TestCase):
 
     def test_reporter_exception_throttled(self):
-        from skywalking.utils import grpc_channel as mod
+        from skywalking.utils import reporter_log as mod
 
         # patch replaces the module dict for this test only (auto-restored);
         # do not .clear() the shared throttle state — that leaks across tests.
@@ -395,7 +396,7 @@ class TestLogThrottle(unittest.TestCase):
             self.assertEqual(len(cm.records), 1)
 
     def test_dropped_throttled_includes_delta_and_total(self):
-        from skywalking.utils import grpc_channel as mod
+        from skywalking.utils import reporter_log as mod
 
         with patch.object(mod, '_last_drop_log_at', {}), \
              patch.object(mod, '_drop_totals', {}), \
@@ -477,7 +478,7 @@ class TestGrpcCallTimeoutAndKeepAlive(unittest.TestCase):
             config.agent_queue_timeout = 1
             self.assertEqual(grpc_call_timeout(), 10.0)
             config.agent_queue_timeout = 20
-            self.assertEqual(grpc_call_timeout(), 21.0)
+            self.assertEqual(grpc_call_timeout(), 25.0)
         finally:
             config.agent_queue_timeout = prev
 
@@ -608,6 +609,99 @@ class TestClosePreviousProtocol(unittest.IsolatedAsyncioTestCase):
         proto.close = MagicMock()
         await _aclose_previous_protocol(proto)
         proto.close.assert_called_once()
+
+
+
+class TestRpcTimeoutVsQueueWindow(unittest.TestCase):
+
+    def test_timeout_has_margin_over_worst_case_batch(self):
+        """RPC timeout must exceed absolute batch window + encode/RTT margin."""
+        from skywalking import config
+
+        prev = config.agent_queue_timeout
+        try:
+            config.agent_queue_timeout = 20
+            timeout = grpc_call_timeout()
+            self.assertEqual(timeout, 20 + _GRPC_RPC_TIMEOUT_MARGIN_SEC)
+            self.assertGreater(timeout, float(config.agent_queue_timeout) + 1.0)
+        finally:
+            config.agent_queue_timeout = prev
+
+    def test_sync_report_uses_timeout_with_margin(self):
+        from skywalking import config
+        from skywalking.client.grpc import GrpcTraceSegmentReportService
+
+        prev = config.agent_queue_timeout
+        try:
+            config.agent_queue_timeout = 20
+            stub = MagicMock()
+            svc = GrpcTraceSegmentReportService.__new__(GrpcTraceSegmentReportService)
+            svc.report_stub = stub
+            svc.report(iter(()))
+            self.assertEqual(
+                stub.collect.call_args.kwargs.get('timeout'),
+                20 + _GRPC_RPC_TIMEOUT_MARGIN_SEC,
+            )
+        finally:
+            config.agent_queue_timeout = prev
+
+
+class TestCollectorChannelNotInstrumented(unittest.TestCase):
+
+    def test_multi_address_collector_channel_skips_sw_interceptor(self):
+        """Regression: ipv4: multi targets must not get sw_grpc client interceptors."""
+        import grpc
+
+        from skywalking import config
+        from skywalking.plugins import sw_grpc
+        from skywalking.utils.grpc_channel import (
+            create_sync_channel,
+            is_agent_collector_channel,
+        )
+
+        prev = config.agent_collector_backend_services
+        sw_grpc.install_sync()
+        try:
+            config.agent_collector_backend_services = '10.0.0.1:11800,10.0.0.2:11800'
+            with patch('grpc.intercept_channel') as intercept:
+                channel = create_sync_channel()
+                intercept.assert_not_called()
+            self.assertTrue(is_agent_collector_channel(channel))
+            with patch('grpc.intercept_channel',
+                       side_effect=lambda c, *a, **k: c) as intercept:
+                grpc.insecure_channel('business.example:50051')
+                intercept.assert_called()
+        finally:
+            config.agent_collector_backend_services = prev
+
+    def test_aio_multi_address_uses_collector_scope(self):
+        from skywalking import config
+        from skywalking.plugins import sw_grpc
+        from skywalking.utils.grpc_channel import (
+            create_aio_channel,
+            is_agent_collector_channel,
+            is_building_agent_collector_channel,
+        )
+
+        prev = config.agent_collector_backend_services
+        sw_grpc.install_async()
+        seen_building = []
+
+        class _Probe:
+            def __init__(self, *args, **kwargs):
+                seen_building.append(is_building_agent_collector_channel())
+                # Minimal stand-in; create_aio_channel only needs a return object.
+                self._sw_agent_collector_channel = False
+
+        try:
+            config.agent_collector_backend_services = '10.0.0.1:11800,10.0.0.2:11800'
+            with patch('skywalking.utils.grpc_channel.grpc.aio.insecure_channel', side_effect=_Probe):
+                channel = create_aio_channel()
+            self.assertEqual(seen_building, [True])
+            self.assertTrue(is_agent_collector_channel(channel))
+            self.assertFalse(is_building_agent_collector_channel())
+        finally:
+            config.agent_collector_backend_services = prev
 
 
 if __name__ == '__main__':

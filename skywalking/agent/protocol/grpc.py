@@ -18,7 +18,7 @@
 import logging
 import traceback
 from queue import Queue, Empty
-from time import time
+from time import monotonic
 
 import grpc
 
@@ -33,8 +33,8 @@ from skywalking.utils.grpc_channel import (
     create_sync_channel,
     handle_rpc_error,
     is_channel_ready,
-    log_dropped_throttled,
 )
+from skywalking.utils.reporter_log import log_dropped_throttled
 from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
 from skywalking.protocol.common.Common_pb2 import KeyStringValuePair
@@ -43,6 +43,25 @@ from skywalking.protocol.logging.Logging_pb2 import LogData
 from skywalking.protocol.language_agent.Meter_pb2 import MeterData
 from skywalking.protocol.profile.Profile_pb2 import ThreadSnapshot, ThreadStack
 from skywalking.trace.segment import Segment
+
+
+def _queue_get_within_batch(queue: Queue, block: bool, batch_deadline: float):
+    """
+    Get one item within an absolute batch window (monotonic deadline).
+
+    Avoids int(elapsed) truncation that could let queue waits approach
+    agent_queue_timeout + 1s and collide with a tight RPC deadline.
+    Returns None when the window is exhausted or the queue is empty.
+    """
+    remaining = batch_deadline - monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        if block:
+            return queue.get(block=True, timeout=remaining)
+        return queue.get(block=False)
+    except Empty:
+        return None
 
 
 class GrpcProtocol(Protocol):
@@ -147,23 +166,15 @@ class GrpcProtocol(Protocol):
         # Gate before dequeue so disconnect windows keep segments in the queue (Node buffer parity).
         if not self.is_ready():
             return
-        start = None
         sent = 0
 
         def generator():
-            nonlocal start, sent
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    segment = queue.get(block=block, timeout=timeout)  # type: Segment
-                except Empty:
+                segment = _queue_get_within_batch(queue, block, batch_deadline)  # type: Segment
+                if segment is None:
                     return
 
                 queue.task_done()
@@ -223,23 +234,15 @@ class GrpcProtocol(Protocol):
     def report_log(self, queue: Queue, block: bool = True):
         if not self.is_ready():
             return
-        start = None
         sent = 0
 
         def generator():
-            nonlocal start, sent
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    log_data = queue.get(block=block, timeout=timeout)  # type: LogData
-                except Empty:
+                log_data = _queue_get_within_batch(queue, block, batch_deadline)  # type: LogData
+                if log_data is None:
                     return
 
                 queue.task_done()
@@ -261,23 +264,15 @@ class GrpcProtocol(Protocol):
     def report_meter(self, queue: Queue, block: bool = True):
         if not self.is_ready():
             return
-        start = None
         sent = 0
 
         def generator():
-            nonlocal start, sent
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    meter_data = queue.get(block=block, timeout=timeout)  # type: MeterData
-                except Empty:
+                meter_data = _queue_get_within_batch(queue, block, batch_deadline)  # type: MeterData
+                if meter_data is None:
                     return
 
                 queue.task_done()
@@ -298,23 +293,15 @@ class GrpcProtocol(Protocol):
     def report_snapshot(self, queue: Queue, block: bool = True):
         if not self.is_ready():
             return
-        start = None
         sent = 0
 
         def generator():
-            nonlocal start, sent
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    snapshot = queue.get(block=block, timeout=timeout)  # type: TracingThreadSnapshot
-                except Empty:
+                snapshot = _queue_get_within_batch(queue, block, batch_deadline)  # type: TracingThreadSnapshot
+                if snapshot is None:
                     return
 
                 queue.task_done()

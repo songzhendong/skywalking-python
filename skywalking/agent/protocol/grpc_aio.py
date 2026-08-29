@@ -28,12 +28,12 @@ from skywalking.agent.protocol.interceptors_aio import header_adder_interceptor_
 from skywalking.client.grpc_aio import GrpcServiceManagementClientAsync, GrpcTraceSegmentReportServiceAsync, \
     GrpcProfileTaskChannelServiceAsync, GrpcLogReportServiceAsync, GrpcMeterReportServiceAsync
 from skywalking.loggings import logger, logger_debug_enabled
+from skywalking.utils.reporter_log import log_dropped_throttled
 from skywalking.utils.grpc_channel import (
     apply_connectivity_transition,
     create_aio_channel,
     handle_rpc_error,
     is_channel_ready,
-    log_dropped_throttled,
 )
 from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot

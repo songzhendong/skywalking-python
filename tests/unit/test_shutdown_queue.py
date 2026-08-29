@@ -119,19 +119,62 @@ class TestShutdownQueueHelpers(unittest.TestCase):
                 await asyncio.sleep(0.05)
 
         try:
-            reporters = [asyncio.run_coroutine_threadsafe(_forever(), loop) for _ in range(2)]
-            time.sleep(0.2)
+            async def _spawn():
+                return [asyncio.create_task(_forever()) for _ in range(2)]
+
+            reporter_tasks = asyncio.run_coroutine_threadsafe(_spawn(), loop).result(timeout=2.0)
+            time.sleep(0.1)
 
             t0 = time.monotonic()
-            future = asyncio.run_coroutine_threadsafe(_cancel_pending_tasks(loop), loop)
+            future = asyncio.run_coroutine_threadsafe(_cancel_pending_tasks(reporter_tasks), loop)
             future.result(timeout=2.0)
             self.assertLess(time.monotonic() - t0, 2.0)
-            for reporter in reporters:
-                self.assertTrue(reporter.cancelled() or reporter.done())
+            for task in reporter_tasks:
+                self.assertTrue(task.cancelled() or task.done())
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2.0)
             loop.close()
+
+    def test_cancel_preserves_asyncio_run_root_so_fini_completes(self):
+        """
+        Production path uses asyncio.run(root). Cancelling the root tears down the Runner
+        and cancels fini before aclose(). Only background tasks may be cancelled.
+        """
+        aclose_done = Event()
+        loop_ready = Event()
+        holder = {}
+
+        async def root():
+            holder['loop'] = asyncio.get_running_loop()
+            holder['root'] = asyncio.current_task()
+
+            async def reporter():
+                while True:
+                    await asyncio.sleep(0.05)
+
+            holder['tasks'] = {asyncio.create_task(reporter()) for _ in range(2)}
+            loop_ready.set()
+            # return_exceptions: cancelled reporters must not surface as root CancelledError
+            await asyncio.gather(*holder['tasks'], return_exceptions=True)
+            holder['root_finished'] = True
+
+        thread = Thread(target=lambda: asyncio.run(root()), daemon=True)
+        thread.start()
+        self.assertTrue(loop_ready.wait(3.0))
+
+        async def fini():
+            # Must not cancel holder["root"]; doing so would cancel this fini via Runner teardown.
+            await _cancel_pending_tasks(holder['tasks'])
+            aclose_done.set()
+            return 'ok'
+
+        result = asyncio.run_coroutine_threadsafe(fini(), holder['loop']).result(timeout=3.0)
+        self.assertEqual(result, 'ok')
+        self.assertTrue(aclose_done.wait(1.0))
+        thread.join(timeout=3.0)
+        self.assertTrue(holder.get('root_finished', False))
+
 
     def test_shutdown_async_queue_bounded(self):
         async def _run():

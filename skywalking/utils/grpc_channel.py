@@ -33,7 +33,7 @@ Multi-backend design (aligned with skywalking-nodejs native failover):
 - Invalid entries are logged and dropped; never silently ignored without a log.
 - HTTP proxy disabled; keepalive channel options intentionally omitted (OAP conflict).
 - Unary and sync streaming RPCs use a deadline (Node 10s floor, always >
-  agent_queue_timeout so sync collect is not cut off by the batching window).
+  agent_queue_timeout + margin so sync collect is not cut off by the batching window).
   Aio client-streaming collect/collectBatch/collectSnapshot omit timeout=
   (generators await empty queues). DEADLINE_EXCEEDED / RESOURCE_EXHAUSTED on a
   READY backend do not rotate or rebuild; failover is for unreachable backends,
@@ -49,9 +49,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
-import os
 import socket
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -94,29 +95,60 @@ GRPC_CHANNEL_OPTIONS: Tuple[Tuple[str, int | str], ...] = (
     ('grpc.max_reconnect_backoff_ms', 30000),
 )
 
-# Node default RPC deadline is 10s. Sync streaming collect must outlive the queue window.
+# Node default RPC deadline is 10s. Sync streaming collect must outlive the queue
+# batch window with room for protobuf encode + RTT + server handling.
+# Sync generators may spend nearly the full queue window on the final queue.get
+# (absolute batch deadline); margin keeps healthy sends off DEADLINE_EXCEEDED.
 # Do not apply this to aio client-streaming: those generators await queue.get() forever.
 _GRPC_RPC_TIMEOUT_FLOOR_SEC = 10.0
+_GRPC_RPC_TIMEOUT_MARGIN_SEC = 5.0
 
 
 def grpc_call_timeout() -> float:
-    """Seconds for unary / sync-streaming stub timeout=. Always > agent_queue_timeout."""
+    """Seconds for unary / sync-streaming stub timeout=. Always > agent_queue_timeout + margin."""
     from skywalking import config
 
-    return max(_GRPC_RPC_TIMEOUT_FLOOR_SEC, float(config.agent_queue_timeout) + 1.0)
+    return max(
+        _GRPC_RPC_TIMEOUT_FLOOR_SEC,
+        float(config.agent_queue_timeout) + _GRPC_RPC_TIMEOUT_MARGIN_SEC,
+    )
 
 
 _AUTH_LOG_INTERVAL_SEC = 60.0
 _last_auth_log_at = 0.0
-_REPORTER_LOG_INTERVAL_SEC = 30.0
-_last_reporter_log_at: Dict[str, float] = {}
 _CONNECTIVITY_LOG_INTERVAL_SEC = 30.0
 _last_connectivity_log_at: Dict[str, float] = {}
-_DROP_LOG_INTERVAL_SEC = 30.0
-_last_drop_log_at: Dict[str, float] = {}
-_drop_totals: Dict[str, int] = {}
-_drop_logged_totals: Dict[str, int] = {}
 _DNS_LOOKUP_TIMEOUT_SEC = 5.0
+
+# Thread-local: set while create_*_channel builds the agent→OAP channel so sw_grpc
+# does not attach client interceptors (multi-address targets no longer match config).
+_building_agent_collector = threading.local()
+_SW_AGENT_COLLECTOR_ATTR = '_sw_agent_collector_channel'
+
+
+@contextmanager
+def agent_collector_channel_scope():
+    _building_agent_collector.active = True
+    try:
+        yield
+    finally:
+        _building_agent_collector.active = False
+
+
+def is_building_agent_collector_channel() -> bool:
+    return bool(getattr(_building_agent_collector, 'active', False))
+
+
+def mark_agent_collector_channel(channel):
+    try:
+        setattr(channel, _SW_AGENT_COLLECTOR_ATTR, True)
+    except Exception:  # noqa: BLE001 - exotic channel wrappers
+        pass
+    return channel
+
+
+def is_agent_collector_channel(channel) -> bool:
+    return bool(getattr(channel, _SW_AGENT_COLLECTOR_ATTR, False))
 
 
 class AddressKind(Enum):
@@ -480,16 +512,19 @@ def create_sync_channel():
     target, authority = _resolve_channel_target_and_authority()
     options = _channel_options(authority)
     logger.info('Creating gRPC channel to collector target %s (authority=%s)', target, authority)
-    try:
-        if config.agent_force_tls:
-            return grpc.secure_channel(target, grpc.ssl_channel_credentials(), options=options)
-        return grpc.insecure_channel(target, options=options)
-    except Exception:  # noqa: BLE001 - never fail host process start
-        logger.exception(
-            'Failed to create gRPC channel to %s; using localhost:1 placeholder',
-            target,
-        )
-        return grpc.insecure_channel('localhost:1', options=options)
+    with agent_collector_channel_scope():
+        try:
+            if config.agent_force_tls:
+                channel = grpc.secure_channel(target, grpc.ssl_channel_credentials(), options=options)
+            else:
+                channel = grpc.insecure_channel(target, options=options)
+        except Exception:  # noqa: BLE001 - never fail host process start
+            logger.exception(
+                'Failed to create gRPC channel to %s; using localhost:1 placeholder',
+                target,
+            )
+            channel = grpc.insecure_channel('localhost:1', options=options)
+        return mark_agent_collector_channel(channel)
 
 
 def create_aio_channel(interceptors=None):
@@ -499,21 +534,24 @@ def create_aio_channel(interceptors=None):
     target, authority = _resolve_channel_target_and_authority()
     options = _channel_options(authority)
     logger.info('Creating aio gRPC channel to collector target %s (authority=%s)', target, authority)
-    try:
-        if config.agent_force_tls:
-            return grpc.aio.secure_channel(
+    with agent_collector_channel_scope():
+        try:
+            if config.agent_force_tls:
+                channel = grpc.aio.secure_channel(
+                    target,
+                    grpc.ssl_channel_credentials(),
+                    options=options,
+                    interceptors=interceptors,
+                )
+            else:
+                channel = grpc.aio.insecure_channel(target, options=options, interceptors=interceptors)
+        except Exception:  # noqa: BLE001 - never fail host process start
+            logger.exception(
+                'Failed to create aio gRPC channel to %s; using localhost:1 placeholder',
                 target,
-                grpc.ssl_channel_credentials(),
-                options=options,
-                interceptors=interceptors,
             )
-        return grpc.aio.insecure_channel(target, options=options, interceptors=interceptors)
-    except Exception:  # noqa: BLE001 - never fail host process start
-        logger.exception(
-            'Failed to create aio gRPC channel to %s; using localhost:1 placeholder',
-            target,
-        )
-        return grpc.aio.insecure_channel('localhost:1', options=options, interceptors=interceptors)
+            channel = grpc.aio.insecure_channel('localhost:1', options=options, interceptors=interceptors)
+        return mark_agent_collector_channel(channel)
 
 
 def _unwrap_connectivity_state(channel, try_to_connect: bool):
@@ -588,49 +626,6 @@ def log_auth_failure_throttled(error: BaseException) -> None:
         'Collector rejected authentication (%s). Check SW_AGENT_AUTHENTICATION; '
         'the agent will not rotate backends for auth failures.',
         error,
-    )
-
-
-def log_reporter_exception_throttled(reporter_name: str, wait: float) -> None:
-    """
-    Throttle reporter exception stacks during outages (otherwise every backoff tick floods logs).
-    """
-    now = time.monotonic()
-    last = _last_reporter_log_at.get(reporter_name, 0.0)
-    if now - last < _REPORTER_LOG_INTERVAL_SEC:
-        return
-    _last_reporter_log_at[reporter_name] = now
-    logger.exception(
-        'Exception in %s service in pid %s, retry in %s seconds',
-        reporter_name,
-        os.getpid(),
-        wait,
-    )
-
-
-def log_dropped_throttled(kind: str, count: int = 1, *, force: bool = False) -> None:
-    """
-    Throttle drop warnings. ``count`` is added to a process-wide total for ``kind``.
-    At most one line per 30s unless ``force`` (shutdown). Message includes this
-    window's increment and the process total.
-    """
-    if count <= 0:
-        return
-    now = time.monotonic()
-    total = _drop_totals.get(kind, 0) + count
-    _drop_totals[kind] = total
-    last = _last_drop_log_at.get(kind, 0.0)
-    if not force and now - last < _DROP_LOG_INTERVAL_SEC:
-        return
-    logged = _drop_logged_totals.get(kind, 0)
-    delta = total - logged
-    _drop_logged_totals[kind] = total
-    _last_drop_log_at[kind] = now
-    logger.warning(
-        'dropped %s: +%d since last log, %d total this process (best-effort; never retried)',
-        kind,
-        delta,
-        total,
     )
 
 

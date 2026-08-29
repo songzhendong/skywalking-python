@@ -33,7 +33,7 @@ from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
 from skywalking.protocol.language_agent.Meter_pb2 import MeterData
 from skywalking.protocol.logging.Logging_pb2 import LogData
-from skywalking.utils.grpc_channel import log_dropped_throttled, log_reporter_exception_throttled
+from skywalking.utils.reporter_log import log_dropped_throttled, log_reporter_exception_throttled
 from skywalking.utils.singleton import Singleton
 
 if TYPE_CHECKING:
@@ -147,13 +147,19 @@ async def _shutdown_async_queue(q: asyncio.Queue, label: str) -> None:
         )
 
 
-async def _cancel_pending_tasks(loop) -> None:
+async def _cancel_pending_tasks(tasks) -> None:
     """
-    Cancel every task on the agent loop except the caller. The current task must be
-    excluded from the gather too, otherwise it would await itself and never return.
+    Cancel agent-owned reporter / connectivity-watch tasks only.
+
+    Must not cancel the asyncio.run root (__start_event_loop_async): that tears down
+    the Runner and cancels this fini coroutine before protocol aclose() runs.
+    The current task (fini) is also excluded so we never await ourselves.
     """
-    current = asyncio.current_task(loop)
-    pending = [task for task in asyncio.all_tasks(loop) if task is not current]
+    current = asyncio.current_task()
+    pending = [
+        task for task in tasks
+        if task is not None and task is not current and not task.done()
+    ]
     if not pending:
         return
     for task in pending:
@@ -814,8 +820,11 @@ class SkyWalkingAgentAsync(Singleton):
 
         await self.__bootstrap()  # gather all coroutines
 
+        # Track Tasks explicitly so shutdown cancels only reporters/watchers, not the
+        # asyncio.run root task that is awaiting this gather.
+        self.background_tasks = {asyncio.create_task(coro) for coro in self.background_coroutines}
         logger.debug('All background coroutines started')
-        await asyncio.gather(*self.background_coroutines)
+        await asyncio.gather(*self.background_tasks)
 
     def __start_event_loop(self) -> None:
         try:
@@ -885,7 +894,7 @@ class SkyWalkingAgentAsync(Singleton):
         if config.agent_meter_reporter_active:
             await _shutdown_async_queue(self.__meter_queue, 'meter')
 
-        await _cancel_pending_tasks(self.loop)
+        await _cancel_pending_tasks(getattr(self, 'background_tasks', ()))
 
         aclose = getattr(self.__protocol, 'aclose', None)
         if callable(aclose):
