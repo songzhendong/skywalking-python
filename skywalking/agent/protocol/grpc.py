@@ -45,20 +45,24 @@ from skywalking.protocol.profile.Profile_pb2 import ThreadSnapshot, ThreadStack
 from skywalking.trace.segment import Segment
 
 
-def _queue_get_within_batch(queue: Queue, block: bool, batch_deadline: float):
+def _queue_get_within_batch(queue: Queue, block: bool, batch_deadline: float, *, allow_immediate: bool = False):
     """
     Get one item within an absolute batch window (monotonic deadline).
 
     Avoids int(elapsed) truncation that could let queue waits approach
     agent_queue_timeout + 1s and collide with a tight RPC deadline.
+    When allow_immediate is True (first generator iteration), still attempt
+    Queue.get once so SW_AGENT_QUEUE_TIMEOUT=0 can drain an immediately
+    available item via get(timeout=0).
     Returns None when the window is exhausted or the queue is empty.
     """
     remaining = batch_deadline - monotonic()
-    if remaining <= 0:
+    if remaining <= 0 and not allow_immediate:
         return None
     try:
         if block:
-            return queue.get(block=True, timeout=remaining)
+            timeout = remaining if remaining > 0 else 0
+            return queue.get(block=True, timeout=timeout)
         return queue.get(block=False)
     except Empty:
         return None
@@ -172,8 +176,10 @@ class GrpcProtocol(Protocol):
             nonlocal sent
 
             batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                segment = _queue_get_within_batch(queue, block, batch_deadline)  # type: Segment
+                segment = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: Segment
+                first_get = False
                 if segment is None:
                     return
 
@@ -240,8 +246,10 @@ class GrpcProtocol(Protocol):
             nonlocal sent
 
             batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                log_data = _queue_get_within_batch(queue, block, batch_deadline)  # type: LogData
+                log_data = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: LogData
+                first_get = False
                 if log_data is None:
                     return
 
@@ -270,8 +278,10 @@ class GrpcProtocol(Protocol):
             nonlocal sent
 
             batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                meter_data = _queue_get_within_batch(queue, block, batch_deadline)  # type: MeterData
+                meter_data = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: MeterData
+                first_get = False
                 if meter_data is None:
                     return
 
@@ -299,8 +309,10 @@ class GrpcProtocol(Protocol):
             nonlocal sent
 
             batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                snapshot = _queue_get_within_batch(queue, block, batch_deadline)  # type: TracingThreadSnapshot
+                snapshot = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: TracingThreadSnapshot
+                first_get = False
                 if snapshot is None:
                     return
 

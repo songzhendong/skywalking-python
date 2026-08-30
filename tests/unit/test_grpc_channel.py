@@ -19,6 +19,8 @@ import socket
 import json
 import unittest
 import asyncio
+from queue import Queue
+from time import monotonic
 from unittest.mock import MagicMock, patch
 
 import grpc
@@ -644,6 +646,28 @@ class TestRpcTimeoutVsQueueWindow(unittest.TestCase):
             )
         finally:
             config.agent_queue_timeout = prev
+
+
+class TestQueueGetWithinBatch(unittest.TestCase):
+
+    def test_queue_timeout_zero_drains_immediately_available_item(self):
+        from skywalking.agent.protocol.grpc import _queue_get_within_batch
+
+        q = Queue()
+        q.put('segment')
+        batch_deadline = monotonic()
+        item = _queue_get_within_batch(q, True, batch_deadline, allow_immediate=True)
+        self.assertEqual(item, 'segment')
+        self.assertTrue(q.empty())
+
+    def test_queue_timeout_zero_skips_when_empty(self):
+        from skywalking.agent.protocol.grpc import _queue_get_within_batch
+
+        q = Queue()
+        batch_deadline = monotonic()
+        self.assertIsNone(
+            _queue_get_within_batch(q, True, batch_deadline, allow_immediate=True),
+        )
 
 
 class TestCollectorChannelNotInstrumented(unittest.TestCase):

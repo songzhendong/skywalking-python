@@ -151,9 +151,8 @@ async def _cancel_pending_tasks(tasks) -> None:
     """
     Cancel agent-owned reporter / connectivity-watch tasks only.
 
-    Must not cancel the asyncio.run root (__start_event_loop_async): that tears down
-    the Runner and cancels this fini coroutine before protocol aclose() runs.
-    The current task (fini) is also excluded so we never await ourselves.
+    Cancel only the given reporter / watch tasks; never the asyncio.run root.
+    The current task is excluded so we never await ourselves.
     """
     current = asyncio.current_task()
     pending = [
@@ -820,11 +819,12 @@ class SkyWalkingAgentAsync(Singleton):
 
         await self.__bootstrap()  # gather all coroutines
 
-        # Track Tasks explicitly so shutdown cancels only reporters/watchers, not the
-        # asyncio.run root task that is awaiting this gather.
         self.background_tasks = {asyncio.create_task(coro) for coro in self.background_coroutines}
         logger.debug('All background coroutines started')
-        await asyncio.gather(*self.background_tasks)
+        # Wait for shutdown inside the asyncio.run root, then clean up here so the
+        # Runner stays alive through protocol aclose() before asyncio.run returns.
+        await self._finished.wait()
+        await self.__async_shutdown_cleanup()
 
     def __start_event_loop(self) -> None:
         try:
@@ -872,17 +872,13 @@ class SkyWalkingAgentAsync(Singleton):
         self.event_loop_thread = Thread(name='event_loop_thread', target=self.__start_event_loop, daemon=True)
         self.event_loop_thread.start()
 
-    async def __fini_async(self):
+    async def __async_shutdown_cleanup(self) -> None:
         """
-        This method is called when the agent is shutting down.
-        Clean up all the queues and stop all the asyncio tasks.
+        Async shutdown body that must run on the asyncio.run root task.
 
         Do not await report_* here: aio generators use unbounded queue.get() and can
         hang forever. Abandon + timed join, then cancel tasks.
         """
-        if self._finished is not None:
-            self._finished.set()
-
         await _shutdown_async_queue(self.__segment_queue, 'segment')
 
         if config.agent_log_reporter_active:
@@ -908,14 +904,13 @@ class SkyWalkingAgentAsync(Singleton):
                 close()
 
     def __fini(self):
-        if not self.loop.is_closed():
-            future = asyncio.run_coroutine_threadsafe(self.__fini_async(), self.loop)
-            try:
-                future.result(timeout=_SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC + _SHUTDOWN_JOIN_TIMEOUT_SEC * 4)
-            except Exception:  # noqa: BLE001 - never block process exit on shutdown
-                logger.exception('async agent shutdown exceeded budget or failed')
-                future.cancel()
-        self.event_loop_thread.join(timeout=_SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC)
+        loop = getattr(self, 'loop', None)
+        if loop is not None and not loop.is_closed() and self._finished is not None:
+            loop.call_soon_threadsafe(self._finished.set)
+        if self.event_loop_thread is not None:
+            self.event_loop_thread.join(
+                timeout=_SHUTDOWN_LOOP_JOIN_TIMEOUT_SEC + _SHUTDOWN_JOIN_TIMEOUT_SEC * 4,
+            )
         if self.event_loop_thread.is_alive():
             logger.warning(
                 'Python agent event_loop thread still alive after %.1fs shutdown budget',
