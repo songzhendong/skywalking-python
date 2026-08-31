@@ -179,14 +179,16 @@ class TestShutdownQueueHelpers(unittest.TestCase):
         self.assertTrue(holder.get('root_finished', False))
 
     def test_background_task_failure_is_logged_not_silenced(self):
-        """Regression: failing background tasks must be observed and logged."""
-        holder = {}
+        """Regression: failing background tasks must be observed and logged exactly once."""
+        holder = {'errors': []}
         error_logged = Event()
+        aclose_done = Event()
 
         class _Handler(logging.Handler):
             def emit(self, record):
-                if 'Error in Python agent asyncio event loop' in record.getMessage():
-                    holder['logged'] = record.getMessage()
+                msg = record.getMessage()
+                if 'Error in Python agent asyncio event loop' in msg:
+                    holder['errors'].append(msg)
                     error_logged.set()
 
         agent_logger = logging.getLogger('skywalking')
@@ -198,6 +200,10 @@ class TestShutdownQueueHelpers(unittest.TestCase):
         async def failing_background():
             await asyncio.sleep(0.02)
             raise ValueError('command dispatch failed')
+
+        async def yielding_aclose():
+            await asyncio.sleep(0.02)
+            aclose_done.set()
 
         async def root():
             finished = asyncio.Event()
@@ -211,6 +217,8 @@ class TestShutdownQueueHelpers(unittest.TestCase):
             reporter_task = asyncio.create_task(reporter())
             tasks = {failing_task, reporter_task}
             await _await_shutdown_or_background_failure(finished, tasks)
+            await _cancel_pending_tasks(tasks)
+            await yielding_aclose()
             holder['after_wait'] = True
             holder['failing_task'] = failing_task
 
@@ -218,10 +226,137 @@ class TestShutdownQueueHelpers(unittest.TestCase):
             asyncio.run(root())
             self.assertTrue(holder.get('after_wait'))
             self.assertTrue(error_logged.wait(2.0))
-            self.assertIn('command dispatch failed', holder.get('logged', ''))
+            self.assertTrue(aclose_done.wait(2.0))
+            self.assertEqual(len(holder['errors']), 1)
+            self.assertIn('command dispatch failed', holder['errors'][0])
             self.assertTrue(holder['finished'].is_set())
             self.assertTrue(holder['failing_task'].done())
             self.assertIsInstance(holder['failing_task'].exception(), ValueError)
+        finally:
+            agent_logger.removeHandler(handler)
+            agent_logger.setLevel(previous_level)
+
+    def test_clean_shutdown_does_not_log_normal_background_completion(self):
+        """Clean shutdown: reporters finish after _finished; cleanup must stay silent."""
+        holder = {'errors': []}
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                if 'Error in Python agent asyncio event loop' in record.getMessage():
+                    holder['errors'].append(record.getMessage())
+
+        agent_logger = logging.getLogger('skywalking')
+        handler = _Handler()
+        agent_logger.addHandler(handler)
+        previous_level = agent_logger.level
+        agent_logger.setLevel(logging.ERROR)
+
+        async def root():
+            finished = asyncio.Event()
+
+            async def reporter():
+                while not finished.is_set():
+                    await asyncio.sleep(0.01)
+
+            tasks = {asyncio.create_task(reporter()) for _ in range(2)}
+            finished.set()
+            await _await_shutdown_or_background_failure(finished, tasks)
+            # Give reporters a turn to observe _finished and return normally.
+            await asyncio.sleep(0.05)
+            await _cancel_pending_tasks(tasks)
+            holder['all_done'] = all(task.done() for task in tasks)
+
+        try:
+            asyncio.run(root())
+            self.assertTrue(holder.get('all_done'))
+            self.assertEqual(holder['errors'], [])
+        finally:
+            agent_logger.removeHandler(handler)
+            agent_logger.setLevel(previous_level)
+
+    def test_unexpected_pre_shutdown_cancellation_is_logged(self):
+        """Cancellation before shutdown must be logged and trigger orderly cleanup."""
+        holder = {'errors': []}
+        error_logged = Event()
+        aclose_done = Event()
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                msg = record.getMessage()
+                if 'Error in Python agent asyncio event loop' in msg:
+                    holder['errors'].append(msg)
+                    error_logged.set()
+
+        agent_logger = logging.getLogger('skywalking')
+        handler = _Handler()
+        agent_logger.addHandler(handler)
+        previous_level = agent_logger.level
+        agent_logger.setLevel(logging.ERROR)
+
+        async def cancelled_background():
+            asyncio.current_task().cancel()
+            await asyncio.sleep(0)
+
+        async def yielding_aclose():
+            await asyncio.sleep(0.02)
+            aclose_done.set()
+
+        async def root():
+            finished = asyncio.Event()
+            holder['finished'] = finished
+
+            async def reporter():
+                while not finished.is_set():
+                    await asyncio.sleep(0.05)
+
+            cancelled_task = asyncio.create_task(cancelled_background())
+            reporter_task = asyncio.create_task(reporter())
+            tasks = {cancelled_task, reporter_task}
+            await _await_shutdown_or_background_failure(finished, tasks)
+            await _cancel_pending_tasks(tasks)
+            await yielding_aclose()
+            holder['after_wait'] = True
+
+        try:
+            asyncio.run(root())
+            self.assertTrue(holder.get('after_wait'))
+            self.assertTrue(error_logged.wait(2.0))
+            self.assertTrue(aclose_done.wait(2.0))
+            self.assertEqual(len(holder['errors']), 1)
+            self.assertIn('cancelled unexpectedly', holder['errors'][0])
+            self.assertTrue(holder['finished'].is_set())
+        finally:
+            agent_logger.removeHandler(handler)
+            agent_logger.setLevel(previous_level)
+
+    def test_intentional_cleanup_cancellation_is_silent(self):
+        """Tasks cancelled by _cancel_pending_tasks during cleanup must not ERROR."""
+        holder = {'errors': []}
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                if 'Error in Python agent asyncio event loop' in record.getMessage():
+                    holder['errors'].append(record.getMessage())
+
+        agent_logger = logging.getLogger('skywalking')
+        handler = _Handler()
+        agent_logger.addHandler(handler)
+        previous_level = agent_logger.level
+        agent_logger.setLevel(logging.ERROR)
+
+        async def forever():
+            while True:
+                await asyncio.sleep(0.05)
+
+        async def root():
+            tasks = {asyncio.create_task(forever()) for _ in range(2)}
+            await _cancel_pending_tasks(tasks)
+            holder['all_done'] = all(task.done() for task in tasks)
+
+        try:
+            asyncio.run(root())
+            self.assertTrue(holder.get('all_done'))
+            self.assertEqual(holder['errors'], [])
         finally:
             agent_logger.removeHandler(handler)
             agent_logger.setLevel(previous_level)
