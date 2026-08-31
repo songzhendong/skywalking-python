@@ -16,6 +16,7 @@
 #
 
 import asyncio
+import logging
 import time
 import unittest
 from queue import Queue
@@ -24,6 +25,7 @@ from threading import Event, Thread
 from skywalking.agent import (
     _abandon_async_queue,
     _abandon_sync_queue,
+    _await_shutdown_or_background_failure,
     _cancel_pending_tasks,
     _join_sync_queue,
     _shutdown_async_queue,
@@ -176,6 +178,53 @@ class TestShutdownQueueHelpers(unittest.TestCase):
         self.assertTrue(aclose_done.wait(2.0))
         self.assertTrue(holder.get('root_finished', False))
 
+    def test_background_task_failure_is_logged_not_silenced(self):
+        """Regression: failing background tasks must be observed and logged."""
+        holder = {}
+        error_logged = Event()
+
+        class _Handler(logging.Handler):
+            def emit(self, record):
+                if 'Error in Python agent asyncio event loop' in record.getMessage():
+                    holder['logged'] = record.getMessage()
+                    error_logged.set()
+
+        agent_logger = logging.getLogger('skywalking')
+        handler = _Handler()
+        agent_logger.addHandler(handler)
+        previous_level = agent_logger.level
+        agent_logger.setLevel(logging.ERROR)
+
+        async def failing_background():
+            await asyncio.sleep(0.02)
+            raise ValueError('command dispatch failed')
+
+        async def root():
+            finished = asyncio.Event()
+            holder['finished'] = finished
+            failing_task = asyncio.create_task(failing_background())
+
+            async def reporter():
+                while not finished.is_set():
+                    await asyncio.sleep(0.05)
+
+            reporter_task = asyncio.create_task(reporter())
+            tasks = {failing_task, reporter_task}
+            await _await_shutdown_or_background_failure(finished, tasks)
+            holder['after_wait'] = True
+            holder['failing_task'] = failing_task
+
+        try:
+            asyncio.run(root())
+            self.assertTrue(holder.get('after_wait'))
+            self.assertTrue(error_logged.wait(2.0))
+            self.assertIn('command dispatch failed', holder.get('logged', ''))
+            self.assertTrue(holder['finished'].is_set())
+            self.assertTrue(holder['failing_task'].done())
+            self.assertIsInstance(holder['failing_task'].exception(), ValueError)
+        finally:
+            agent_logger.removeHandler(handler)
+            agent_logger.setLevel(previous_level)
 
     def test_shutdown_async_queue_bounded(self):
         async def _run():

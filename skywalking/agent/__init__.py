@@ -147,6 +147,66 @@ async def _shutdown_async_queue(q: asyncio.Queue, label: str) -> None:
         )
 
 
+def _retrieve_background_task_outcome(task: asyncio.Task):
+    """
+    Return a completed background task's exception, or a sentinel for unexpected success.
+
+    Retrieves the exception so asyncio does not emit "never retrieved" warnings.
+    """
+    if task is None or not task.done() or task.cancelled():
+        return None
+    exc = task.exception()
+    if exc is not None:
+        return exc
+    return RuntimeError('Python agent asyncio background task finished unexpectedly')
+
+
+def _log_background_task_outcome(task: asyncio.Task) -> bool:
+    """Log and retrieve a completed background task outcome. Returns True if logged."""
+    exc = _retrieve_background_task_outcome(task)
+    if exc is None:
+        return False
+    logger.error('Error in Python agent asyncio event loop: %s', exc, exc_info=exc)
+    return True
+
+
+async def _await_shutdown_or_background_failure(
+    finished: asyncio.Event,
+    background_tasks,
+) -> None:
+    """
+    Wait for shutdown or the first unexpected background-task completion.
+
+    Background tasks are expected to run until shutdown. If one finishes early,
+    retrieve/log its outcome and signal shutdown so the root can clean up.
+    """
+    shutdown_waiter = asyncio.create_task(finished.wait())
+    pending = {task for task in background_tasks if task is not None}
+    try:
+        while not finished.is_set():
+            if not pending:
+                await finished.wait()
+                return
+            done, _ = await asyncio.wait(
+                pending | {shutdown_waiter},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if shutdown_waiter in done or finished.is_set():
+                return
+            for task in done:
+                pending.discard(task)
+                if _log_background_task_outcome(task):
+                    finished.set()
+                    return
+    finally:
+        if not shutdown_waiter.done():
+            shutdown_waiter.cancel()
+            try:
+                await shutdown_waiter
+            except asyncio.CancelledError:
+                pass
+
+
 async def _cancel_pending_tasks(tasks) -> None:
     """
     Cancel agent-owned reporter / connectivity-watch tasks only.
@@ -155,6 +215,11 @@ async def _cancel_pending_tasks(tasks) -> None:
     The current task is excluded so we never await ourselves.
     """
     current = asyncio.current_task()
+    for task in tasks:
+        if task is None or task is current:
+            continue
+        if task.done():
+            _log_background_task_outcome(task)
     pending = [
         task for task in tasks
         if task is not None and task is not current and not task.done()
@@ -174,6 +239,8 @@ async def _cancel_pending_tasks(tasks) -> None:
             _SHUTDOWN_JOIN_TIMEOUT_SEC,
             sum(1 for task in pending if not task.done()),
         )
+    for task in pending:
+        _log_background_task_outcome(task)
 
 
 def _close_previous_protocol(protocol) -> None:
@@ -821,9 +888,10 @@ class SkyWalkingAgentAsync(Singleton):
 
         self.background_tasks = {asyncio.create_task(coro) for coro in self.background_coroutines}
         logger.debug('All background coroutines started')
-        # Wait for shutdown inside the asyncio.run root, then clean up here so the
-        # Runner stays alive through protocol aclose() before asyncio.run returns.
-        await self._finished.wait()
+        # Wait for shutdown or unexpected background-task completion inside the
+        # asyncio.run root, then clean up here so the Runner stays alive through
+        # protocol aclose() before asyncio.run returns.
+        await _await_shutdown_or_background_failure(self._finished, self.background_tasks)
         await self.__async_shutdown_cleanup()
 
     def __start_event_loop(self) -> None:
