@@ -147,25 +147,53 @@ async def _shutdown_async_queue(q: asyncio.Queue, label: str) -> None:
         )
 
 
-def _retrieve_background_task_outcome(task: asyncio.Task):
+def _retrieve_background_task_outcome(
+    task: asyncio.Task,
+    *,
+    report_unexpected_completion: bool = True,
+    report_unexpected_cancellation: bool = False,
+):
     """
-    Return a completed background task's exception, or a sentinel for unexpected success.
+    Return a completed background task's exception when it should be reported.
 
     Retrieves the exception so asyncio does not emit "never retrieved" warnings.
+    Successful completion / cancellation are only converted to errors when the
+    corresponding report_* flag is set (supervisor path before shutdown).
     """
-    if task is None or not task.done() or task.cancelled():
+    if task is None or not task.done():
+        return None
+    if task.cancelled():
+        if report_unexpected_cancellation:
+            return RuntimeError(
+                'Python agent asyncio background task was cancelled unexpectedly'
+            )
         return None
     exc = task.exception()
     if exc is not None:
         return exc
-    return RuntimeError('Python agent asyncio background task finished unexpectedly')
+    if report_unexpected_completion:
+        return RuntimeError('Python agent asyncio background task finished unexpectedly')
+    return None
 
 
-def _log_background_task_outcome(task: asyncio.Task) -> bool:
+def _log_background_task_outcome(
+    task: asyncio.Task,
+    *,
+    report_unexpected_completion: bool = True,
+    report_unexpected_cancellation: bool = False,
+) -> bool:
     """Log and retrieve a completed background task outcome. Returns True if logged."""
-    exc = _retrieve_background_task_outcome(task)
+    if getattr(task, '_sw_outcome_handled', False):
+        return False
+    exc = _retrieve_background_task_outcome(
+        task,
+        report_unexpected_completion=report_unexpected_completion,
+        report_unexpected_cancellation=report_unexpected_cancellation,
+    )
     if exc is None:
         return False
+    # Mark before logging so cleanup never re-logs a supervisor-handled outcome.
+    task._sw_outcome_handled = True
     logger.error('Error in Python agent asyncio event loop: %s', exc, exc_info=exc)
     return True
 
@@ -177,8 +205,9 @@ async def _await_shutdown_or_background_failure(
     """
     Wait for shutdown or the first unexpected background-task completion.
 
-    Background tasks are expected to run until shutdown. If one finishes early,
-    retrieve/log its outcome and signal shutdown so the root can clean up.
+    Background tasks are expected to run until shutdown. If one finishes or is
+    cancelled early, retrieve/log its outcome and signal shutdown so the root
+    can clean up.
     """
     shutdown_waiter = asyncio.create_task(finished.wait())
     pending = {task for task in background_tasks if task is not None}
@@ -195,7 +224,12 @@ async def _await_shutdown_or_background_failure(
                 return
             for task in done:
                 pending.discard(task)
-                if _log_background_task_outcome(task):
+                # Before shutdown, both early success and unexpected cancel are errors.
+                if _log_background_task_outcome(
+                    task,
+                    report_unexpected_completion=True,
+                    report_unexpected_cancellation=True,
+                ):
                     finished.set()
                     return
     finally:
@@ -213,13 +247,20 @@ async def _cancel_pending_tasks(tasks) -> None:
 
     Cancel only the given reporter / watch tasks; never the asyncio.run root.
     The current task is excluded so we never await ourselves.
+
+    During cleanup, normal completion and intentional cancellation are silent;
+    only real exceptions that were not already handled by the supervisor are logged.
     """
     current = asyncio.current_task()
     for task in tasks:
         if task is None or task is current:
             continue
         if task.done():
-            _log_background_task_outcome(task)
+            _log_background_task_outcome(
+                task,
+                report_unexpected_completion=False,
+                report_unexpected_cancellation=False,
+            )
     pending = [
         task for task in tasks
         if task is not None and task is not current and not task.done()
@@ -240,7 +281,11 @@ async def _cancel_pending_tasks(tasks) -> None:
             sum(1 for task in pending if not task.done()),
         )
     for task in pending:
-        _log_background_task_outcome(task)
+        _log_background_task_outcome(
+            task,
+            report_unexpected_completion=False,
+            report_unexpected_cancellation=False,
+        )
 
 
 def _close_previous_protocol(protocol) -> None:
