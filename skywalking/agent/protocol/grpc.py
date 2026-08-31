@@ -18,7 +18,7 @@
 import logging
 import traceback
 from queue import Queue, Empty
-from time import time
+from time import monotonic
 
 import grpc
 
@@ -28,6 +28,13 @@ from skywalking.agent.protocol.interceptors import header_adder_interceptor
 from skywalking.client.grpc import GrpcServiceManagementClient, GrpcTraceSegmentReportService, \
     GrpcProfileTaskChannelService, GrpcLogDataReportService, GrpcMeterReportService
 from skywalking.loggings import logger, logger_debug_enabled
+from skywalking.utils.grpc_channel import (
+    apply_connectivity_transition,
+    create_sync_channel,
+    handle_rpc_error,
+    is_channel_ready,
+)
+from skywalking.utils.reporter_log import log_dropped_throttled
 from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
 from skywalking.protocol.common.Common_pb2 import KeyStringValuePair
@@ -38,78 +45,146 @@ from skywalking.protocol.profile.Profile_pb2 import ThreadSnapshot, ThreadStack
 from skywalking.trace.segment import Segment
 
 
+def _queue_get_within_batch(queue: Queue, block: bool, batch_deadline: float, *, allow_immediate: bool = False):
+    """
+    Get one item within an absolute batch window (monotonic deadline).
+
+    Avoids int(elapsed) truncation that could let queue waits approach
+    agent_queue_timeout + 1s and collide with a tight RPC deadline.
+    When allow_immediate is True (first generator iteration), still attempt
+    Queue.get once so SW_AGENT_QUEUE_TIMEOUT=0 can drain an immediately
+    available item via get(timeout=0).
+    Returns None when the window is exhausted or the queue is empty.
+    """
+    remaining = batch_deadline - monotonic()
+    if remaining <= 0 and not allow_immediate:
+        return None
+    try:
+        if block:
+            timeout = remaining if remaining > 0 else 0
+            return queue.get(block=True, timeout=timeout)
+        return queue.get(block=False)
+    except Empty:
+        return None
+
+
 class GrpcProtocol(Protocol):
     def __init__(self):
         self.properties_sent = False
         self.state = None
 
-        if config.agent_force_tls:
-            self.channel = grpc.secure_channel(config.agent_collector_backend_services, grpc.ssl_channel_credentials())
-        else:
-            self.channel = grpc.insecure_channel(config.agent_collector_backend_services)
+        # One channel for process lifetime; multi-address failover via gRPC pick_first.
+        self.channel = create_sync_channel()
 
         if config.agent_authentication:
             self.channel = grpc.intercept_channel(
                 self.channel, header_adder_interceptor('authentication', config.agent_authentication)
             )
 
-        self.channel.subscribe(self._cb, try_to_connect=True)
         self.service_management = GrpcServiceManagementClient(self.channel)
         self.traces_reporter = GrpcTraceSegmentReportService(self.channel)
         self.profile_channel = GrpcProfileTaskChannelService(self.channel)
         self.log_reporter = GrpcLogDataReportService(self.channel)
         self.meter_reporter = GrpcMeterReportService(self.channel)
 
+        # Subscribe last: _cb runs on a grpc thread and touches service_management.
+        self.channel.subscribe(self._cb, try_to_connect=True)
+
+    def is_ready(self) -> bool:
+        """
+        Node CONNECTED ≈ subscribe-watched gRPC READY.
+
+        Sync grpcio has no Channel.get_state(); check_connectivity_state can disagree
+        with subscribe callbacks on some builds and permanently skipped all RPCs in
+        E2E (channel already READY via subscribe, reporters still gated). Use the
+        watched state as source of truth; only nudge C-core when IDLE.
+        """
+        if self.state == grpc.ChannelConnectivity.READY:
+            return True
+        if self.state == grpc.ChannelConnectivity.IDLE:
+            # Side-effect nudge (ignore return); subscribe callback updates self.state.
+            is_channel_ready(self.channel)
+        return self.state == grpc.ChannelConnectivity.READY
+
     def _cb(self, state):
+        prev = self.state
         if logger_debug_enabled:
-            logger.debug('grpc channel connectivity changed, [%s -> %s]', self.state, state)
+            logger.debug('grpc channel connectivity changed, [%s -> %s]', prev, state)
+        try:
+            apply_connectivity_transition(prev, state)
+            # Independent OAPs need properties re-registered after failover.
+            # Immediate send via properties_sent; periodic refresh covers silent READY switches.
+            if prev == grpc.ChannelConnectivity.READY and state != grpc.ChannelConnectivity.READY:
+                self.properties_sent = False
+                self.service_management.sent_properties_counter = 0
+        except Exception:  # noqa: BLE001 - never let grpc's connectivity thread die on us
+            logger.exception('failed to handle grpc connectivity transition')
         self.state = state
 
     def query_profile_commands(self):
+        if not self.is_ready():
+            return
         if logger_debug_enabled:
             logger.debug('query profile commands')
         self.profile_channel.do_query()
 
     def notify_profile_task_finish(self, task: ProfileTask):
+        if not self.is_ready():
+            return
         self.profile_channel.finish(task)
 
     def heartbeat(self):
-        try:
-            if not self.properties_sent:
+        if not self.is_ready():
+            return
+        if not self.properties_sent:
+            try:
                 self.service_management.send_instance_props()
                 self.properties_sent = True
-
+            except grpc.RpcError as e:
+                handle_rpc_error(e, self.on_error)
+        try:
             self.service_management.send_heart_beat()
-
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            handle_rpc_error(e, self.on_error)
             raise
 
     def on_error(self):
+        # Re-subscribe the same channel only — never rebuild or rotate backends here.
+        # DEADLINE_EXCEEDED on READY is not a connectivity failure; see handle_rpc_error.
         traceback.print_exc() if logger.isEnabledFor(logging.DEBUG) else None
         self.channel.unsubscribe(self._cb)
         self.channel.subscribe(self._cb, try_to_connect=True)
 
+    def close(self):
+        """Best-effort channel teardown on agent stop (Node shutdownNow parity)."""
+        try:
+            self.channel.unsubscribe(self._cb)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.channel.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def report_segment(self, queue: Queue, block: bool = True):
-        start = None
+        # Gate before dequeue so disconnect windows keep segments in the queue (Node buffer parity).
+        if not self.is_ready():
+            return
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    segment = queue.get(block=block, timeout=timeout)  # type: Segment
-                except Empty:
+                segment = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: Segment
+                first_get = False
+                if segment is None:
                     return
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('reporting segment %s', segment)
@@ -156,30 +231,30 @@ class GrpcProtocol(Protocol):
 
         try:
             self.traces_reporter.report(generator())
-        except grpc.RpcError:
-            self.on_error()
-            raise  # reraise so that incremental reconnect wait can process
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('segment', sent)
+            handle_rpc_error(e, self.on_error)
+            raise  # reraise so that incremental reconnect wait can process; failed batch discarded
 
     def report_log(self, queue: Queue, block: bool = True):
-        start = None
+        if not self.is_ready():
+            return
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    log_data = queue.get(block=block, timeout=timeout)  # type: LogData
-                except Empty:
+                log_data = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: LogData
+                first_get = False
+                if log_data is None:
                     return
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('Reporting Log')
@@ -188,30 +263,30 @@ class GrpcProtocol(Protocol):
 
         try:
             self.log_reporter.report(generator())
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('log', sent)
+            handle_rpc_error(e, self.on_error)
             raise
 
     def report_meter(self, queue: Queue, block: bool = True):
-        start = None
+        if not self.is_ready():
+            return
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    meter_data = queue.get(block=block, timeout=timeout)  # type: MeterData
-                except Empty:
+                meter_data = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: MeterData
+                first_get = False
+                if meter_data is None:
                     return
 
                 queue.task_done()
+                sent += 1
 
                 yield meter_data
 
@@ -219,30 +294,30 @@ class GrpcProtocol(Protocol):
             if logger_debug_enabled:
                 logger.debug('Reporting Meter')
             self.meter_reporter.report(generator())
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('meter', sent)
+            handle_rpc_error(e, self.on_error)
             raise
 
     def report_snapshot(self, queue: Queue, block: bool = True):
-        start = None
+        if not self.is_ready():
+            return
+        sent = 0
 
         def generator():
-            nonlocal start
+            nonlocal sent
 
+            batch_deadline = monotonic() + float(config.agent_queue_timeout)
+            first_get = True
             while True:
-                try:
-                    timeout = config.agent_queue_timeout  # type: int
-                    if not start:  # make sure first time through queue is always checked
-                        start = time()
-                    else:
-                        timeout -= int(time() - start)
-                        if timeout <= 0:  # this is to make sure we exit eventually instead of being fed continuously
-                            return
-                    snapshot = queue.get(block=block, timeout=timeout)  # type: TracingThreadSnapshot
-                except Empty:
+                snapshot = _queue_get_within_batch(queue, block, batch_deadline, allow_immediate=first_get)  # type: TracingThreadSnapshot
+                first_get = False
+                if snapshot is None:
                     return
 
                 queue.task_done()
+                sent += 1
 
                 transform_snapshot = ThreadSnapshot(
                     taskId=str(snapshot.task_id),
@@ -256,6 +331,8 @@ class GrpcProtocol(Protocol):
 
         try:
             self.profile_channel.report(generator())
-        except grpc.RpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('snapshot', sent)
+            handle_rpc_error(e, self.on_error)
             raise

@@ -20,6 +20,7 @@ import grpc
 from skywalking import config
 from skywalking.client import ServiceManagementClientAsync, TraceSegmentReportServiceAsync, \
     ProfileTaskChannelServiceAsync, LogDataReportServiceAsync, MeterReportServiceAsync
+from skywalking.utils.grpc_channel import grpc_call_timeout
 from skywalking.command import command_service_async
 from skywalking.loggings import logger, logger_debug_enabled
 from skywalking.profile import profile_task_execution_service
@@ -40,19 +41,28 @@ class GrpcServiceManagementClientAsync(ServiceManagementClientAsync):
         self.service_stub = ManagementServiceStub(channel)
 
     async def send_instance_props(self):
-        await self.service_stub.reportInstanceProperties(InstanceProperties(
-            service=config.agent_name,
-            serviceInstance=config.agent_instance_name,
-            properties=self.instance_properties,
-        ))
+        await self.service_stub.reportInstanceProperties(
+            InstanceProperties(
+                service=config.agent_name,
+                serviceInstance=config.agent_instance_name,
+                properties=self.instance_properties,
+            ),
+            timeout=grpc_call_timeout(),
+        )
 
     async def send_heart_beat(self):
-        await self.refresh_instance_props()
+        try:
+            await self.refresh_instance_props()
+        except grpc.RpcError:
+            logger.exception('reportInstanceProperties during keepAlive failed; sending ping anyway')
 
-        await self.service_stub.keepAlive(InstancePingPkg(
-            service=config.agent_name,
-            serviceInstance=config.agent_instance_name,
-        ))
+        await self.service_stub.keepAlive(
+            InstancePingPkg(
+                service=config.agent_name,
+                serviceInstance=config.agent_instance_name,
+            ),
+            timeout=grpc_call_timeout(),
+        )
 
         if logger_debug_enabled:
             logger.debug(
@@ -68,6 +78,8 @@ class GrpcTraceSegmentReportServiceAsync(TraceSegmentReportServiceAsync):
         self.report_stub = TraceSegmentReportServiceStub(channel)
 
     async def report(self, generator):
+        # Aio generators await queue.get() with no idle stop; a deadline would
+        # DEADLINE_EXCEEDED healthy long-lived streams and drop already-sent items.
         await self.report_stub.collect(generator)
 
 
@@ -103,7 +115,7 @@ class GrpcProfileTaskChannelServiceAsync(ProfileTaskChannelServiceAsync):
             lastCommandTime=profile_task_execution_service.get_last_command_create_time()
         )
 
-        commands = await self.profile_stub.getProfileTaskCommands(query)
+        commands = await self.profile_stub.getProfileTaskCommands(query, timeout=grpc_call_timeout())
         command_service_async.receive_command(commands)  # put_nowait() not need to be awaited
 
     async def report(self, generator):
@@ -115,4 +127,4 @@ class GrpcProfileTaskChannelServiceAsync(ProfileTaskChannelServiceAsync):
             serviceInstance=config.agent_instance_name,
             taskId=task.task_id
         )
-        await self.profile_stub.reportTaskFinish(finish_report)
+        await self.profile_stub.reportTaskFinish(finish_report, timeout=grpc_call_timeout())

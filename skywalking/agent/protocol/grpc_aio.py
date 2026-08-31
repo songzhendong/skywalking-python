@@ -17,6 +17,7 @@
 
 import logging
 import traceback
+import asyncio
 from asyncio import Queue, Event
 
 import grpc
@@ -27,6 +28,13 @@ from skywalking.agent.protocol.interceptors_aio import header_adder_interceptor_
 from skywalking.client.grpc_aio import GrpcServiceManagementClientAsync, GrpcTraceSegmentReportServiceAsync, \
     GrpcProfileTaskChannelServiceAsync, GrpcLogReportServiceAsync, GrpcMeterReportServiceAsync
 from skywalking.loggings import logger, logger_debug_enabled
+from skywalking.utils.reporter_log import log_dropped_throttled
+from skywalking.utils.grpc_channel import (
+    apply_connectivity_transition,
+    create_aio_channel,
+    handle_rpc_error,
+    is_channel_ready,
+)
 from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
 from skywalking.protocol.common.Common_pb2 import KeyStringValuePair
@@ -43,23 +51,17 @@ class GrpcProtocolAsync(ProtocolAsync):
     """
     def __init__(self):
         self.properties_sent = Event()
+        self.state = None
 
-        # grpc.aio.channel do not have subscribe() method to set a callback when channel state changed
-        # instead, it has wait_for_state_change()/get_state() method to get the current state of the channel
-        # since here is an inherent race between the invocation of `wait_for_state_change` and `get_state`,
-        # and the channel state is only used for debug, the cost of monitoring this value is too high to support.
-        # self.state = None
+        # grpc.aio has no Channel.subscribe(); watch_connectivity() mirrors Node
+        # watchConnectivityState via wait_for_state_change (started by the agent loop).
 
         interceptors = None
         if config.agent_authentication:
             interceptors = [header_adder_interceptor_async('authentication', config.agent_authentication)]
 
-        if config.agent_force_tls:
-            self.channel = grpc.aio.secure_channel(config.agent_collector_backend_services,
-                                                   grpc.ssl_channel_credentials(), interceptors=interceptors)
-        else:
-            self.channel = grpc.aio.insecure_channel(config.agent_collector_backend_services,
-                                                     interceptors=interceptors)
+        # One channel for process lifetime; multi-address failover via gRPC pick_first.
+        self.channel = create_aio_channel(interceptors=interceptors)
 
         self.service_management = GrpcServiceManagementClientAsync(self.channel)
         self.traces_reporter = GrpcTraceSegmentReportServiceAsync(self.channel)
@@ -67,38 +69,118 @@ class GrpcProtocolAsync(ProtocolAsync):
         self.meter_reporter = GrpcMeterReportServiceAsync(self.channel)
         self.profile_channel = GrpcProfileTaskChannelServiceAsync(self.channel)
 
+    def is_ready(self) -> bool:
+        """Prefer watch-maintained state; peek+nudge when IDLE/None before watch catches up."""
+        if self.state == grpc.ChannelConnectivity.READY:
+            return True
+        if self.state in (None, grpc.ChannelConnectivity.IDLE):
+            try:
+                peeked = self.channel.get_state(True)
+                if peeked is not None:
+                    self._on_connectivity(peeked)
+            except Exception:  # noqa: BLE001
+                is_channel_ready(self.channel)
+        return self.state == grpc.ChannelConnectivity.READY
+
+    def _on_connectivity(self, state) -> None:
+        prev = self.state
+        if logger_debug_enabled:
+            logger.debug('grpc aio channel connectivity changed, [%s -> %s]', prev, state)
+        apply_connectivity_transition(prev, state)
+        if prev == grpc.ChannelConnectivity.READY and state != grpc.ChannelConnectivity.READY:
+            self.properties_sent.clear()
+            self.service_management.sent_properties_counter = 0
+        self.state = state
+
+    async def watch_connectivity(self):
+        """
+        Background watch: aio equivalent of sync Channel.subscribe.
+        get_state(True) nudges IDLE; wait_for_state_change blocks until transition.
+        """
+        while True:
+            try:
+                state = self.channel.get_state(try_to_connect=True)
+                self._on_connectivity(state)
+                await self.channel.wait_for_state_change(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep watch alive across transient errors
+                if logger_debug_enabled:
+                    logger.debug('aio connectivity watch error', exc_info=True)
+                await asyncio.sleep(1.0)
+
     async def query_profile_commands(self):
+        if not self.is_ready():
+            return
         if logger_debug_enabled:
             logger.debug('query profile commands')
         await self.profile_channel.do_query()
 
     async def notify_profile_task_finish(self, task: ProfileTask):
+        if not self.is_ready():
+            return
         await self.profile_channel.finish(task)
 
     async def heartbeat(self):
-        try:
-            if not self.properties_sent.is_set():
+        if not self.is_ready():
+            return
+        if not self.properties_sent.is_set():
+            try:
                 await self.service_management.send_instance_props()
                 self.properties_sent.set()
-
+            except grpc.aio.AioRpcError as e:
+                handle_rpc_error(e, self.on_error)
+        try:
             await self.service_management.send_heart_beat()
-
-        except grpc.aio.AioRpcError:
-            self.on_error()
+        except grpc.aio.AioRpcError as e:
+            handle_rpc_error(e, self.on_error)
             raise
 
     def on_error(self):
         if logger_debug_enabled:
             logger.debug('error occurred in grpc protocol (Async)')
+        # Never rebuild / rotate the channel on RPC errors (auth or otherwise).
+        # DEADLINE_EXCEEDED on READY is not a connectivity failure; see handle_rpc_error.
         traceback.print_exc() if logger.isEnabledFor(logging.DEBUG) else None
 
+    def close(self):
+        """Best-effort channel teardown on agent stop (Node shutdownNow parity)."""
+        # grpc.aio.Channel.close is async; schedule on the running loop when possible.
+        try:
+            result = self.channel.close()
+            if asyncio.iscoroutine(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # Called off-loop (should not happen from __fini_async); drop.
+                    result.close()
+                    return
+                loop.create_task(result)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def aclose(self):
+        """Await channel close from the agent event loop."""
+        try:
+            await self.channel.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def report_segment(self, queue: Queue):
+        # Gate before dequeue so disconnect windows keep segments in the queue.
+        if not self.is_ready():
+            return
+
+        sent = 0
+
         async def generator():
+            nonlocal sent
             while True:
                 # Let eventloop schedule blocking instead of user configuration: `config.agent_queue_timeout`
                 segment = await queue.get()  # type: Segment
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('reporting segment %s', segment)
@@ -145,17 +227,26 @@ class GrpcProtocolAsync(ProtocolAsync):
 
         try:
             await self.traces_reporter.report(generator())
-        except grpc.aio.AioRpcError:
-            self.on_error()
-            raise  # reraise so that incremental reconnect wait can process
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('segment', sent)
+            handle_rpc_error(e, self.on_error)
+            raise  # reraise so that incremental reconnect wait can process; failed batch discarded
 
     async def report_log(self, queue: Queue):
+        if not self.is_ready():
+            return
+
+        sent = 0
+
         async def generator():
+            nonlocal sent
             while True:
                 # Let eventloop schedule blocking instead of user configuration: `config.agent_queue_timeout`
                 log_data = await queue.get()  # type: LogData
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('Reporting Log %s', log_data.timestamp)
@@ -164,17 +255,26 @@ class GrpcProtocolAsync(ProtocolAsync):
 
         try:
             await self.log_reporter.report(generator())
-        except grpc.aio.AioRpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('log', sent)
+            handle_rpc_error(e, self.on_error)
             raise
 
     async def report_meter(self, queue: Queue):
+        if not self.is_ready():
+            return
+
+        sent = 0
+
         async def generator():
+            nonlocal sent
             while True:
                 # Let eventloop schedule blocking instead of user configuration: `config.agent_queue_timeout`
                 meter_data = await queue.get()  # type: MeterData
 
                 queue.task_done()
+                sent += 1
 
                 if logger_debug_enabled:
                     logger.debug('Reporting Meter %s', meter_data.timestamp)
@@ -183,17 +283,26 @@ class GrpcProtocolAsync(ProtocolAsync):
 
         try:
             await self.meter_reporter.report(generator())
-        except grpc.aio.AioRpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('meter', sent)
+            handle_rpc_error(e, self.on_error)
             raise
 
     async def report_snapshot(self, queue: Queue):
+        if not self.is_ready():
+            return
+
+        sent = 0
+
         async def generator():
+            nonlocal sent
             while True:
                 # Let eventloop schedule blocking instead of user configuration: `config.agent_queue_timeout`
                 snapshot = await queue.get()  # type: TracingThreadSnapshot
 
                 queue.task_done()
+                sent += 1
 
                 transform_snapshot = ThreadSnapshot(
                     taskId=str(snapshot.task_id),
@@ -207,6 +316,8 @@ class GrpcProtocolAsync(ProtocolAsync):
 
         try:
             await self.profile_channel.report(generator())
-        except grpc.aio.AioRpcError:
-            self.on_error()
+        except grpc.RpcError as e:
+            if sent:
+                log_dropped_throttled('snapshot', sent)
+            handle_rpc_error(e, self.on_error)
             raise
