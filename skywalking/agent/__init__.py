@@ -193,7 +193,7 @@ def _log_background_task_outcome(
     if exc is None:
         return False
     # Mark before logging so cleanup never re-logs a supervisor-handled outcome.
-    setattr(task, '_sw_outcome_handled', True)
+    task._sw_outcome_handled = True
     logger.error('Error in Python agent asyncio event loop: %s', exc, exc_info=exc)
     return True
 
