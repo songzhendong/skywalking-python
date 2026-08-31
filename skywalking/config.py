@@ -44,8 +44,11 @@ options = globals().copy()
 # THIS MUST PRECEDE DIRECTLY BEFORE LIST OF CONFIG OPTIONS!
 
 # BEGIN: Agent Core Configuration Options
-# The backend OAP server address, 11800 is default OAP gRPC port, 12800 is HTTP, Kafka ignores this option
-# and uses kafka_bootstrap_servers option. **This option should be changed accordingly with selected protocol**
+# The backend OAP server address(es). 11800 is default OAP gRPC port, 12800 is HTTP, Kafka ignores this option
+# and uses kafka_bootstrap_servers option. For gRPC, a comma-separated list enables native pick_first failover
+# (per-process shuffle of the preferred backend; :authority stays the first configured endpoint).
+# See Intrusive.md for encoding, DNS, TLS authority, proxy, and READY-gate details.
+# **This option should be changed accordingly with selected protocol**
 agent_collector_backend_services: str = os.getenv('SW_AGENT_COLLECTOR_BACKEND_SERVICES', 'oap_host:oap_port')
 # The protocol to communicate with the backend OAP, `http`, `grpc` or `kafka`, **we highly suggest using `grpc` in
 # production as it's well optimized than `http`**. The `kafka` protocol provides an alternative way to submit data to
@@ -74,7 +77,9 @@ kafka_topic_meter: str = os.getenv('SW_KAFKA_TOPIC_METER', 'skywalking-meters')
 # [here](https://kafka-python.readthedocs.io/en/master/apidoc/KafkaProducer.html#kafka.KafkaProducer)
 # This config only works from env variables, each one should be passed in `SW_KAFKA_REPORTER_CONFIG_<KEY_NAME>`
 kafka_reporter_custom_configurations: str = os.getenv('SW_KAFKA_REPORTER_CUSTOM_CONFIGURATIONS', '')
-# Use TLS for communication with SkyWalking OAP (no cert required)
+# Use TLS for gRPC/HTTP with the OAP (no client cert required). For gRPC, ensure the server
+# certificate SAN matches the first usable backend in agent_collector_backend_services
+# (used as grpc.default_authority).
 agent_force_tls: bool = os.getenv('SW_AGENT_FORCE_TLS', '').lower() == 'true'
 # The authentication token to verify that the agent is trusted by the backend OAP, as for how to configure the
 # backend, refer to [the yaml](https://github.com/apache/skywalking/blob/4f0f39ffccdc9b41049903cc540b8904f7c9728e/
@@ -88,7 +93,8 @@ agent_logging_level: str = os.getenv('SW_AGENT_LOGGING_LEVEL', 'INFO')
 # The agent will exchange heartbeat message with SkyWalking OAP backend every `period` seconds
 agent_collector_heartbeat_period: int = int(os.getenv('SW_AGENT_COLLECTOR_HEARTBEAT_PERIOD', '30'))
 # The agent will report service instance properties every
-# `factor * heartbeat period` seconds default: 10*30 = 300 seconds
+# `factor * heartbeat period` seconds default: 10*30 = 300 seconds (Java/Node cadence).
+# Also covers gRPC pick_first silent backend switches that stay READY without a disconnect event.
 agent_collector_properties_report_period_factor = int(
     os.getenv('SW_AGENT_COLLECTOR_PROPERTIES_REPORT_PERIOD_FACTOR', '10'))
 # A custom JSON string to be reported as service instance properties, e.g. `{"key": "value"}`

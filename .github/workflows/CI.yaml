@@ -305,13 +305,55 @@ jobs:
           name: e2e_logs_${{ matrix.case.name }}_${{ matrix.python-image-variant }}
           path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
 
+  # Separate from the main E2E matrix so the 20m job timeout stays tight for
+  # ordinary cases; failover pulls two OAPs and needs its own headroom.
+  # Span oldest/mid/newest CPython in the support window — pick_first / IPv6
+  # encoding / default_authority are grpcio C-core sensitive.
+  e2e-failover:
+    name: E2E Failover
+    needs: [ license-and-lint, changes, plugin-doc-check, docker-e2e ]
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking-python') || needs.changes.outputs.agent == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-image-variant: [ "3.10-slim", "3.12-slim", "3.14-slim" ]
+      fail-fast: false
+    steps:
+      - name: Checkout source codes
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Pull SkyWalking Python agent base image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images-skywalking-python-e2e-${{ matrix.python-image-variant }}
+          path: docker-images
+      - name: Load docker images
+        run: find docker-images -name "*.tar" -exec docker load -i {} \;
+      - name: Run Failover E2E
+        uses: apache/skywalking-infra-e2e@cf589b4a0b9f8e6f436f78e9cfd94a1ee5494180
+        with:
+          log-dir: /tmp/e2e-logs
+          e2e-file: tests/e2e/case/grpc/failover/e2e.yaml
+      - name: Upload Logs
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() }}
+        with:
+          name: e2e_logs_gRPC-failover_${{ matrix.python-image-variant }}
+          path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
+
+
   CheckStatus:
     # a required check that must pass before merging a PR
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # wait upon them regardless of success or skipped or failure
     if: ${{ always() }}
-    needs: [ license-and-lint, changes, plugin-and-unit-tests, plugin-doc-check, e2e-tests ]
+    needs: [ license-and-lint, changes, plugin-and-unit-tests, plugin-doc-check, e2e-tests, e2e-failover ]
     steps:
       - name: Merge Requirement
         # check license, lint, plugin and e2e tests, then naturally exits 0
@@ -320,9 +362,11 @@ jobs:
           lintResults=${{ needs.license-and-lint.result }}
           pluginResults=${{ needs.plugin-and-unit-tests.result }};
           e2eResults=${{ needs.e2e-tests.result }};
+          e2eFailoverResults=${{ needs.e2e-failover.result }};
           docCheckResults=${{ needs.plugin-doc-check.result }};
           [[ ${lintResults} == 'success' ]] || exit 2;
           [[ ${docCheckResults} == 'success' ]] || exit 3;
           [[ ${pluginResults} == 'success' ]] || [[ ${execute} != 'true' && ${pluginResults} == 'skipped' ]] || exit 4;
           [[ ${e2eResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eResults} == 'skipped' ]] || exit 5;
+          [[ ${e2eFailoverResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eFailoverResults} == 'skipped' ]] || exit 6;
           exit 0;

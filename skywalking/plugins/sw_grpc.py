@@ -236,8 +236,15 @@ def install_sync() -> None:
                 return self._intercept(continuation, client_call_details, request_iterator)
 
         def _sw_grpc_channel_factory(target: str, *args: Any, **kwargs: Any):
+            from skywalking.utils.grpc_channel import is_building_agent_collector_channel
+
             c = _grpc_channel(target, *args, **kwargs)
-            if target == config.agent_collector_backend_services:
+            # Prefer agent→OAP build scope: multi-address targets are rewritten (ipv4:/ipv6:)
+            # and no longer equal agent_collector_backend_services.
+            if (
+                is_building_agent_collector_channel()
+                or target == config.agent_collector_backend_services
+            ):
                 return c
             return grpc.intercept_channel(c, _ClientInterceptor(target))
 
@@ -463,7 +470,14 @@ def install_async() -> None:
                 compression: Optional[grpc.Compression],
                 interceptors: Optional[Sequence[grpc.aio.ClientInterceptor]],
             ):
-                if target != config.agent_collector_backend_services:
+                from skywalking.utils.grpc_channel import is_building_agent_collector_channel
+
+                # Multi-address collector targets are rewritten; do not rely on string equality alone.
+                skip_sw = (
+                    is_building_agent_collector_channel()
+                    or target == config.agent_collector_backend_services
+                )
+                if not skip_sw:
                     _sw_interceptors: List[grpc.aio.ClientInterceptor] = [
                         _AioClientUnaryUnaryInterceptor(target),
                         _AioClientUnaryStreamInterceptor(target),

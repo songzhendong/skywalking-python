@@ -20,6 +20,7 @@ import grpc
 from skywalking import config
 from skywalking.client import ServiceManagementClient, TraceSegmentReportService, ProfileTaskChannelService, \
     LogDataReportService, MeterReportService
+from skywalking.utils.grpc_channel import grpc_call_timeout
 from skywalking.command import command_service
 from skywalking.loggings import logger, logger_debug_enabled
 from skywalking.profile import profile_task_execution_service
@@ -40,19 +41,29 @@ class GrpcServiceManagementClient(ServiceManagementClient):
         self.service_stub = ManagementServiceStub(channel)
 
     def send_instance_props(self):
-        self.service_stub.reportInstanceProperties(InstanceProperties(
-            service=config.agent_name,
-            serviceInstance=config.agent_instance_name,
-            properties=self.instance_properties,
-        ))
+        self.service_stub.reportInstanceProperties(
+            InstanceProperties(
+                service=config.agent_name,
+                serviceInstance=config.agent_instance_name,
+                properties=self.instance_properties,
+            ),
+            timeout=grpc_call_timeout(),
+        )
 
     def send_heart_beat(self):
-        self.refresh_instance_props()
+        # Periodic properties refresh must not block keepAlive (oversized JSON, etc.).
+        try:
+            self.refresh_instance_props()
+        except grpc.RpcError:
+            logger.exception('reportInstanceProperties during keepAlive failed; sending ping anyway')
 
-        self.service_stub.keepAlive(InstancePingPkg(
-            service=config.agent_name,
-            serviceInstance=config.agent_instance_name,
-        ))
+        self.service_stub.keepAlive(
+            InstancePingPkg(
+                service=config.agent_name,
+                serviceInstance=config.agent_instance_name,
+            ),
+            timeout=grpc_call_timeout(),
+        )
 
         if logger_debug_enabled:
             logger.debug(
@@ -67,7 +78,7 @@ class GrpcTraceSegmentReportService(TraceSegmentReportService):
         self.report_stub = TraceSegmentReportServiceStub(channel)
 
     def report(self, generator):
-        self.report_stub.collect(generator)
+        self.report_stub.collect(generator, timeout=grpc_call_timeout())
 
 
 class GrpcMeterReportService(MeterReportService):
@@ -75,10 +86,10 @@ class GrpcMeterReportService(MeterReportService):
         self.report_stub = MeterReportServiceStub(channel)
 
     def report_batch(self, generator):
-        self.report_stub.collectBatch(generator)
+        self.report_stub.collectBatch(generator, timeout=grpc_call_timeout())
 
     def report(self, generator):
-        self.report_stub.collect(generator)
+        self.report_stub.collect(generator, timeout=grpc_call_timeout())
 
 
 class GrpcLogDataReportService(LogDataReportService):
@@ -86,7 +97,7 @@ class GrpcLogDataReportService(LogDataReportService):
         self.report_stub = LogReportServiceStub(channel)
 
     def report(self, generator):
-        self.report_stub.collect(generator)
+        self.report_stub.collect(generator, timeout=grpc_call_timeout())
 
 
 class GrpcProfileTaskChannelService(ProfileTaskChannelService):
@@ -100,11 +111,11 @@ class GrpcProfileTaskChannelService(ProfileTaskChannelService):
             lastCommandTime=profile_task_execution_service.get_last_command_create_time()
         )
 
-        commands = self.profile_stub.getProfileTaskCommands(query)
+        commands = self.profile_stub.getProfileTaskCommands(query, timeout=grpc_call_timeout())
         command_service.receive_command(commands)
 
     def report(self, generator):
-        self.profile_stub.collectSnapshot(generator)
+        self.profile_stub.collectSnapshot(generator, timeout=grpc_call_timeout())
 
     def finish(self, task: ProfileTask):
         finish_report = ProfileTaskFinishReport(
@@ -112,4 +123,4 @@ class GrpcProfileTaskChannelService(ProfileTaskChannelService):
             serviceInstance=config.agent_instance_name,
             taskId=task.task_id
         )
-        self.profile_stub.reportTaskFinish(finish_report)
+        self.profile_stub.reportTaskFinish(finish_report, timeout=grpc_call_timeout())

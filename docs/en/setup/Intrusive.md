@@ -27,6 +27,39 @@ config.init(agent_collector_backend_services='127.0.0.1:11800', agent_name='your
 agent.start()
 ```
 
+#### gRPC multi-address (failover)
+
+Pass a comma-separated list. The agent opens **one** gRPC channel and lets C-core `pick_first` fail over (same idea as Node `sw-static`). Each process shuffles the preferred backend at channel build; `:authority` / TLS SNI still use the **first configured** endpoint.
+
+```python
+config.init(
+    agent_collector_backend_services='oap-a:11800,oap-b:11800',
+    agent_name='your awesome service',
+)
+agent.start()
+```
+
+Implementation notes (maintainers / operators):
+
+- Mixed IPv4/IPv6 stays in one list; IPv4 is encoded as IPv4-mapped IPv6 for grpcio so `pick_first` can try both families.
+- Multi-hostname lists are DNS-expanded once at channel build (about 5s lookup budget per name); there is no periodic re-resolve — prefer a single address or stable IPs when DNS changes.
+- Channel `:authority` / TLS SAN uses `grpc.default_authority` = the first configured endpoint (before shuffle). With `agent_force_tls`, every backend cert must cover that authority.
+- Reporters wait until the channel is READY; non-READY skips the RPC rather than failing fast into a black hole.
+- After a silent backend switch that stays READY, instance properties are re-reported on the normal properties period so the new OAP learns the instance.
+- Reconnect backoff caps at 30s.
+
+#### gRPC HTTP proxy (behavior change)
+
+`grpc.enable_http_proxy=0` is set on **every** gRPC channel, including a single-address config. Host `http_proxy` / `https_proxy` / `no_proxy` are ignored for OAP traffic.
+
+If you currently reach OAP only through an HTTP CONNECT proxy, upgrading this agent will lose that path. The agent disables the proxy so application proxy env vars cannot silently black-hole telemetry, and because HTTP CONNECT happens before name resolution — it cannot express a comma-separated backend list.
+
+#### Best-effort reporting and buffers
+
+Send failures are discarded and never retried (a failed batch is dropped). On process shutdown the agent flushes only while the channel is READY, with a short time budget, then **abandons** whatever is still queued.
+
+When a reporter queue is full (`SW_AGENT_TRACE_REPORTER_MAX_BUFFER_SIZE` / log / meter / snapshot equivalents), new items are dropped. The agent logs drops at most once per 30 seconds, with the increment since the last line and the process total. Raise the buffer if you routinely see these under load; a full queue during an outage is expected because the READY gate holds data until the backend returns.
+
 ### Report data via HTTP protocol
 
 However, if you want to use HTTP protocol to report data, configure `agent_collector_backend_services`
