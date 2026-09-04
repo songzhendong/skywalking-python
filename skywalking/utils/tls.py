@@ -168,23 +168,32 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
 
     verify is True (system CAs), a CA file path, or unused for plaintext callers.
     cert is (cert_path, key_path) when mTLS files are present.
+
+    Keeps the same enable/disable decision as grpc_ssl_credentials / tls_pem_material
+    so an unreadable or oversized CA cannot leave HTTP on https:// with a bad verify path.
     """
     from skywalking import config
 
-    if not collector_uses_tls():
+    material = tls_pem_material()
+    if material is None:
         return True, None
 
+    root_certificates, private_key, certificate_chain = material
     ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
-    verify: object = str(ca_path) if ca_path is not None else True
+    # Prefer the CA file when it was successfully loaded into material.
+    if root_certificates is not None and ca_path is not None:
+        verify: object = str(ca_path)
+    else:
+        verify = True
 
-    chain, key = _mtls_material()
-    if chain is None or key is None:
+    if private_key is None or certificate_chain is None:
         return verify, None
 
-    return verify, (
-        str(ssl_file_path(config.agent_ssl_cert_chain_path)),
-        str(ssl_file_path(config.agent_ssl_key_path)),
-    )
+    cert_path = ssl_file_path(config.agent_ssl_cert_chain_path)
+    key_path = ssl_file_path(config.agent_ssl_key_path)
+    if cert_path is None or key_path is None:
+        return verify, None
+    return verify, (str(cert_path), str(key_path))
 
 
 def configure_requests_session(session) -> None:
@@ -198,19 +207,21 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
     """stdlib SSLContext for aiohttp, or None when the collector stays plaintext."""
     from skywalking import config
 
-    if not collector_uses_tls():
+    material = tls_pem_material()
+    if material is None:
         return None
 
+    root_certificates, private_key, certificate_chain = material
     ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
-    if ca_path is not None:
+    if root_certificates is not None and ca_path is not None:
         ctx = ssl.create_default_context(cafile=str(ca_path))
     else:
+        # FORCE_TLS without usable CA → process trust store (Java FORCE_TLS path).
         ctx = ssl.create_default_context()
 
-    chain, key = _mtls_material()
-    if chain is not None and key is not None:
-        ctx.load_cert_chain(
-            str(ssl_file_path(config.agent_ssl_cert_chain_path)),
-            str(ssl_file_path(config.agent_ssl_key_path)),
-        )
+    if private_key is not None and certificate_chain is not None:
+        cert_path = ssl_file_path(config.agent_ssl_cert_chain_path)
+        key_path = ssl_file_path(config.agent_ssl_key_path)
+        if cert_path is not None and key_path is not None:
+            ctx.load_cert_chain(str(cert_path), str(key_path))
     return ctx

@@ -24,6 +24,7 @@ from skywalking.utils.tls import (
     collector_http_scheme,
     collector_uses_tls,
     requests_tls_settings,
+    ssl_context_for_collector,
     tls_pem_material,
 )
 
@@ -140,6 +141,12 @@ class TestCollectorTls(unittest.TestCase):
             with self.assertLogs('skywalking', level='WARNING') as logs:
                 self.assertIsNone(tls_pem_material())
             self.assertTrue(any('trusted CA' in line or 'exceeds' in line for line in logs.output))
+            # HTTP must not stay on https:// with a bad CA verify path.
+            self.assertEqual(collector_http_scheme(), 'http://')
+            verify, cert = requests_tls_settings()
+            self.assertTrue(verify)
+            self.assertIsNone(cert)
+            self.assertIsNone(ssl_context_for_collector())
 
 
 if __name__ == '__main__':
