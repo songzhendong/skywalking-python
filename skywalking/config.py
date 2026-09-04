@@ -90,8 +90,8 @@ agent_ssl_trusted_ca_path: str = os.getenv('SW_AGENT_SSL_TRUSTED_CA_PATH', '')
 # agent_ssl_key_path is also set (Java agent.ssl_cert_chain_path). Missing files log a
 # warning and keep one-way TLS.
 agent_ssl_cert_chain_path: str = os.getenv('SW_AGENT_SSL_CERT_CHAIN_PATH', '')
-# PEM of the agent private key for mTLS (unencrypted). Used with agent_ssl_cert_chain_path
-# (Java agent.ssl_key_path).
+# PEM of the agent private key for mTLS (unencrypted). PKCS#1 is converted to PKCS#8
+# like Java PrivateKeyUtil. Used with agent_ssl_cert_chain_path (Java agent.ssl_key_path).
 agent_ssl_key_path: str = os.getenv('SW_AGENT_SSL_KEY_PATH', '')
 # The authentication token to verify that the agent is trusted by the backend OAP, as for how to configure the
 # backend, refer to [the yaml](https://github.com/apache/skywalking/blob/4f0f39ffccdc9b41049903cc540b8904f7c9728e/

@@ -52,7 +52,8 @@ Aligned with Java `TLSChannelBuilder`:
 - `agent_force_tls=true` → TLS with the process trust store (no client cert).
 - If `agent_ssl_trusted_ca_path` is a readable PEM file → TLS using that CA, even when `agent_force_tls` is false.
 - mTLS is on only when the CA file exists **and** both `agent_ssl_cert_chain_path` and `agent_ssl_key_path` are readable PEMs. Missing cert/key logs a warning and stays one-way TLS (Java parity; does not abort start).
-- Paths are absolute or relative to the process working directory. Encrypted private keys are not decrypted (Java `PrivateKeyUtil` is not ported).
+- Paths are absolute or relative to the process working directory. PKCS#1 (`BEGIN RSA PRIVATE KEY`) is converted to PKCS#8 like Java `PrivateKeyUtil`; passphrase-encrypted private keys are not supported.
+- E2E coverage (real OAP, same idea as Java `simple/ssl` and `simple/mtls`): `tests/e2e/case/grpc/ssl/` and `tests/e2e/case/grpc/mtls/`.
 
 ```python
 config.init(

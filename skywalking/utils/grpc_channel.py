@@ -499,21 +499,30 @@ def resolve_grpc_target(services: Optional[str] = None) -> str:
     return build_grpc_target(parse_backend_addresses(raw))
 
 
-def _channel_options(default_authority: str) -> Tuple[Tuple[str, int | str], ...]:
+def _channel_options(default_authority: str, *, tls: bool = False) -> Tuple[Tuple[str, int | str], ...]:
     options = list(GRPC_CHANNEL_OPTIONS)
     # Align with Node sw-static getDefaultAuthority (first usable backend).
     options.append(('grpc.default_authority', default_authority))
+    if tls:
+        # BoringSSL verifies the authority hostname; strip :port so CN/SAN like
+        # ``oap`` matches collector ``oap:11800`` (Java Netty does this implicitly).
+        host = default_authority
+        if host.startswith('[') and ']' in host:
+            host = host[1:host.index(']')]
+        elif ':' in host:
+            host = host.rsplit(':', 1)[0]
+        options.append(('grpc.ssl_target_name_override', host))
     return tuple(options)
 
 
 def create_sync_channel():
     """Create one sync gRPC channel (caller may wrap with auth interceptor)."""
     target, authority = _resolve_channel_target_and_authority()
-    options = _channel_options(authority)
-    logger.info('Creating gRPC channel to collector target %s (authority=%s)', target, authority)
     with agent_collector_channel_scope():
         try:
             credentials = grpc_ssl_credentials()
+            options = _channel_options(authority, tls=credentials is not None)
+            logger.info('Creating gRPC channel to collector target %s (authority=%s)', target, authority)
             if credentials is not None:
                 channel = grpc.secure_channel(target, credentials, options=options)
             else:
@@ -523,18 +532,18 @@ def create_sync_channel():
                 'Failed to create gRPC channel to %s; using localhost:1 placeholder',
                 target,
             )
-            channel = grpc.insecure_channel('localhost:1', options=options)
+            channel = grpc.insecure_channel('localhost:1', options=_channel_options(authority))
         return mark_agent_collector_channel(channel)
 
 
 def create_aio_channel(interceptors=None):
     """Create one aio gRPC channel with optional interceptors."""
     target, authority = _resolve_channel_target_and_authority()
-    options = _channel_options(authority)
-    logger.info('Creating aio gRPC channel to collector target %s (authority=%s)', target, authority)
     with agent_collector_channel_scope():
         try:
             credentials = grpc_ssl_credentials()
+            options = _channel_options(authority, tls=credentials is not None)
+            logger.info('Creating aio gRPC channel to collector target %s (authority=%s)', target, authority)
             if credentials is not None:
                 channel = grpc.aio.secure_channel(
                     target,
@@ -549,7 +558,9 @@ def create_aio_channel(interceptors=None):
                 'Failed to create aio gRPC channel to %s; using localhost:1 placeholder',
                 target,
             )
-            channel = grpc.aio.insecure_channel('localhost:1', options=options, interceptors=interceptors)
+            channel = grpc.aio.insecure_channel(
+                'localhost:1', options=_channel_options(authority), interceptors=interceptors,
+            )
         return mark_agent_collector_channel(channel)
 
 

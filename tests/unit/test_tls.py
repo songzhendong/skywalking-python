@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ from skywalking import config
 from skywalking.utils.tls import (
     collector_http_scheme,
     collector_uses_tls,
+    normalize_private_key_pem,
     requests_tls_settings,
     ssl_context_for_collector,
     tls_pem_material,
@@ -89,7 +91,58 @@ class TestCollectorTls(unittest.TestCase):
             self.assertEqual(tls_pem_material(), (b'CA-PEM', b'KEY-PEM', b'CERT-PEM'))
             verify, pair = requests_tls_settings()
             self.assertEqual(verify, str(ca))
-            self.assertEqual(pair, (str(crt), str(key)))
+            self.assertIsNotNone(pair)
+            cert_file, key_file = pair
+            self.assertEqual(Path(cert_file).read_bytes(), b'CERT-PEM')
+            self.assertEqual(Path(key_file).read_bytes(), b'KEY-PEM')
+
+    def test_normalize_pkcs1_to_pkcs8(self):
+        # Synthetic PKCS#1 body — exercises Java PrivateKeyUtil-style wrap only.
+        der = b'\x30' + b'\x00' * 31
+        body = base64.b64encode(der).decode('ascii')
+        pkcs1 = (
+            '-----BEGIN RSA PRIVATE KEY-----\n'
+            f'{body}\n'
+            '-----END RSA PRIVATE KEY-----\n'
+        ).encode('ascii')
+        out = normalize_private_key_pem(pkcs1)
+        text = out.decode('ascii')
+        self.assertIn('-----BEGIN PRIVATE KEY-----', text)
+        self.assertIn('-----END PRIVATE KEY-----', text)
+        self.assertNotIn('BEGIN RSA PRIVATE KEY', text)
+
+        # Pass-through for already-PKCS#8.
+        pkcs8 = b'-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n'
+        self.assertEqual(normalize_private_key_pem(pkcs8), pkcs8)
+
+    def test_mtls_converts_pkcs1_key_for_grpc_and_http(self):
+        der = b'\x30' + b'\x00' * 31
+        body = base64.b64encode(der).decode('ascii')
+        pkcs1 = (
+            '-----BEGIN RSA PRIVATE KEY-----\n'
+            f'{body}\n'
+            '-----END RSA PRIVATE KEY-----\n'
+        ).encode('ascii')
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = Path(tmp) / 'ca.crt'
+            crt = Path(tmp) / 'client.crt'
+            key = Path(tmp) / 'client.pem'
+            ca.write_bytes(b'CA-PEM')
+            crt.write_bytes(b'CERT-PEM')
+            key.write_bytes(pkcs1)
+            config.agent_ssl_trusted_ca_path = str(ca)
+            config.agent_ssl_cert_chain_path = str(crt)
+            config.agent_ssl_key_path = str(key)
+
+            roots, private_key, chain = tls_pem_material()
+            self.assertEqual(roots, b'CA-PEM')
+            self.assertEqual(chain, b'CERT-PEM')
+            self.assertIn(b'BEGIN PRIVATE KEY', private_key)
+            self.assertNotIn(b'BEGIN RSA PRIVATE KEY', private_key)
+
+            verify, pair = requests_tls_settings()
+            self.assertEqual(verify, str(ca))
+            self.assertEqual(Path(pair[1]).read_bytes(), private_key)
 
     def test_missing_key_stays_one_way_tls(self):
         with tempfile.TemporaryDirectory() as tmp:
