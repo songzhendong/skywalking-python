@@ -60,6 +60,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import grpc
 
 from skywalking.loggings import logger
+from skywalking.utils.tls import grpc_ssl_credentials
 
 # Retry only unary idempotent reportInstanceProperties (Node service_config parity).
 # Client-streaming collect must NOT be retried — replay would duplicate segments.
@@ -507,15 +508,14 @@ def _channel_options(default_authority: str) -> Tuple[Tuple[str, int | str], ...
 
 def create_sync_channel():
     """Create one sync gRPC channel (caller may wrap with auth interceptor)."""
-    from skywalking import config
-
     target, authority = _resolve_channel_target_and_authority()
     options = _channel_options(authority)
     logger.info('Creating gRPC channel to collector target %s (authority=%s)', target, authority)
     with agent_collector_channel_scope():
         try:
-            if config.agent_force_tls:
-                channel = grpc.secure_channel(target, grpc.ssl_channel_credentials(), options=options)
+            credentials = grpc_ssl_credentials()
+            if credentials is not None:
+                channel = grpc.secure_channel(target, credentials, options=options)
             else:
                 channel = grpc.insecure_channel(target, options=options)
         except Exception:  # noqa: BLE001 - never fail host process start
@@ -529,17 +529,16 @@ def create_sync_channel():
 
 def create_aio_channel(interceptors=None):
     """Create one aio gRPC channel with optional interceptors."""
-    from skywalking import config
-
     target, authority = _resolve_channel_target_and_authority()
     options = _channel_options(authority)
     logger.info('Creating aio gRPC channel to collector target %s (authority=%s)', target, authority)
     with agent_collector_channel_scope():
         try:
-            if config.agent_force_tls:
+            credentials = grpc_ssl_credentials()
+            if credentials is not None:
                 channel = grpc.aio.secure_channel(
                     target,
-                    grpc.ssl_channel_credentials(),
+                    credentials,
                     options=options,
                     interceptors=interceptors,
                 )

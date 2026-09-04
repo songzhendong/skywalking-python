@@ -43,7 +43,26 @@ Implementation notes (maintainers / operators):
 
 - Mixed IPv4/IPv6 stays in one list; IPv4 is encoded as IPv4-mapped IPv6 for grpcio so `pick_first` can try both families.
 - Multi-hostname lists are DNS-expanded once at channel build (about 5s lookup budget per name); there is no periodic re-resolve — prefer a single address or stable IPs when DNS changes.
-- Channel `:authority` / TLS SAN uses `grpc.default_authority` = the first configured endpoint (before shuffle). With `agent_force_tls`, every backend cert must cover that authority.
+- Channel `:authority` / TLS SAN uses `grpc.default_authority` = the first configured endpoint (before shuffle). With TLS (`agent_force_tls` or a CA file), every backend cert must cover that authority.
+
+#### gRPC / HTTP TLS and mTLS
+
+Aligned with Java `TLSChannelBuilder`:
+
+- `agent_force_tls=true` → TLS with the process trust store (no client cert).
+- If `agent_ssl_trusted_ca_path` is a readable PEM file → TLS using that CA, even when `agent_force_tls` is false.
+- mTLS is on only when the CA file exists **and** both `agent_ssl_cert_chain_path` and `agent_ssl_key_path` are readable PEMs. Missing cert/key logs a warning and stays one-way TLS (Java parity; does not abort start).
+- Paths are absolute or relative to the process working directory. Encrypted private keys are not decrypted (Java `PrivateKeyUtil` is not ported).
+
+```python
+config.init(
+    agent_collector_backend_services='oap.example:11800',
+    agent_force_tls=True,
+    agent_ssl_trusted_ca_path='/etc/skywalking/ca.crt',
+    agent_ssl_cert_chain_path='/etc/skywalking/client.crt',
+    agent_ssl_key_path='/etc/skywalking/client.pem',
+)
+```
 - Reporters wait until the channel is READY; non-READY skips the RPC rather than failing fast into a black hole.
 - After a silent backend switch that stays READY, instance properties are re-reported on the normal properties period so the new OAP learns the instance.
 - Reconnect backoff caps at 30s.
