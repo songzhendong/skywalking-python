@@ -280,7 +280,7 @@ class TestGrpcBackendAddress(unittest.TestCase):
 
             with patch('skywalking.utils.grpc_channel.socket.getaddrinfo', side_effect=fake_getaddrinfo), \
                  patch('skywalking.utils.grpc_channel.grpc.secure_channel') as secure, \
-                 patch('skywalking.utils.grpc_channel.grpc.ssl_channel_credentials', return_value='creds'):
+                 patch('skywalking.utils.grpc_channel.grpc_ssl_credentials', return_value='creds'):
                 create_sync_channel()
             args, kwargs = secure.call_args
             self.assertEqual(args[0], 'ipv4:10.0.0.1:11800,10.0.0.2:11800')
