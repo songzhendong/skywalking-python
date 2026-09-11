@@ -33,5 +33,7 @@ header:
     - '.venv'
     - 'poetry.lock'
     - '**/*.txt'
+    - '**/*.pem'
+    - '**/*.crt'
 
   comment: on-failure
