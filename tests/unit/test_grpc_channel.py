@@ -139,9 +139,10 @@ class TestGrpcBackendAddress(unittest.TestCase):
 
         with patch('skywalking.utils.grpc_channel.socket.getaddrinfo', side_effect=fake_getaddrinfo):
             target = build_grpc_target(parse_backend_addresses('oap-a:11800,oap-b:11800'))
+        # Expanded endpoints are sorted by (kind, host, port) for stable DNS fingerprints.
         self.assertEqual(
             target,
-            'ipv6:[::ffff:10.0.0.1]:11800,[2001:db8::1]:11800,[::ffff:10.0.0.2]:11800',
+            'ipv6:[::ffff:10.0.0.1]:11800,[::ffff:10.0.0.2]:11800,[2001:db8::1]:11800',
         )
 
     def test_encode_rejects_hostname(self):

@@ -879,6 +879,10 @@ class SkyWalkingAgentAsync(Singleton):
         if callable(watch):
             self.background_coroutines.add(watch())
 
+        dns_watch = getattr(self.__protocol, 'watch_dns_reresolve', None)
+        if callable(dns_watch):
+            self.background_coroutines.add(dns_watch())
+
         self.background_coroutines.add(self.__heartbeat())
         self.background_coroutines.add(self.__report_segment())
 
@@ -1002,6 +1006,12 @@ class SkyWalkingAgentAsync(Singleton):
 
         if config.agent_meter_reporter_active:
             await _shutdown_async_queue(self.__meter_queue, 'meter')
+
+        # Mark aio protocol closed + wake watches before canceling tasks so
+        # in-flight DNS to_thread work refuses to bind after resolve returns.
+        begin_shutdown = getattr(self.__protocol, 'begin_shutdown', None)
+        if callable(begin_shutdown):
+            begin_shutdown()
 
         await _cancel_pending_tasks(getattr(self, 'background_tasks', ()))
 
