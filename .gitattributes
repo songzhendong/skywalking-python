@@ -1,0 +1,7 @@
+# Force LF for shell scripts so bind-mounted scripts in Linux containers
+# are not broken by CRLF (e.g. ``set -eu\r``).
+*.sh text eol=lf
+
+# Keep Python sources LF so `git diff --check` does not treat CR as trailing
+# whitespace on Windows checkouts (core.autocrlf).
+*.py text eol=lf

@@ -77,10 +77,27 @@ kafka_topic_meter: str = os.getenv('SW_KAFKA_TOPIC_METER', 'skywalking-meters')
 # [here](https://kafka-python.readthedocs.io/en/master/apidoc/KafkaProducer.html#kafka.KafkaProducer)
 # This config only works from env variables, each one should be passed in `SW_KAFKA_REPORTER_CONFIG_<KEY_NAME>`
 kafka_reporter_custom_configurations: str = os.getenv('SW_KAFKA_REPORTER_CUSTOM_CONFIGURATIONS', '')
-# Use TLS for gRPC/HTTP with the OAP (no client cert required). For gRPC, ensure the server
-# certificate SAN matches the first usable backend in agent_collector_backend_services
-# (used as grpc.default_authority).
+# Use TLS for gRPC/HTTP with the OAP. One-way TLS uses the process trust store unless
+# agent_ssl_trusted_ca_path points to a readable, parseable CA PEM. For gRPC,
+# :authority and TLS peer-name checks use grpc.default_authority = the first
+# configured endpoint (host after SplitHostPort; port is never checked). The
+# dial target may differ after multi-backend shuffle/DNS expand. If even
+# process-trust credentials cannot be built, reporters warn and stay plaintext
+# (FORCE_TLS never aborts agent start).
 agent_force_tls: bool = os.getenv('SW_AGENT_FORCE_TLS', '').lower() == 'true'
+# PEM of the CA that signed the OAP server certificate. If this file exists and
+# parses as a CA PEM, the agent uses TLS even when agent_force_tls is false.
+# Missing/unreadable/invalid PEM without FORCE_TLS stays plaintext. Absolute
+# path or relative to the process working directory; symlinks to regular files
+# are followed. Empty means no custom CA. PEM files larger than 256KiB are rejected.
+agent_ssl_trusted_ca_path: str = os.getenv('SW_AGENT_SSL_TRUSTED_CA_PATH', '')
+# PEM of the agent certificate chain for mTLS. Used only when a usable CA was
+# loaded and agent_ssl_key_path is also set. Missing files log a warning and
+# keep one-way TLS. Symlinks to regular files are followed; 256KiB size cap.
+agent_ssl_cert_chain_path: str = os.getenv('SW_AGENT_SSL_CERT_CHAIN_PATH', '')
+# PEM of the agent private key for mTLS (unencrypted). PKCS#1 is converted to PKCS#8.
+# Used with agent_ssl_cert_chain_path. Symlinks to regular files are followed; 256KiB size cap.
+agent_ssl_key_path: str = os.getenv('SW_AGENT_SSL_KEY_PATH', '')
 # The authentication token to verify that the agent is trusted by the backend OAP, as for how to configure the
 # backend, refer to [the yaml](https://github.com/apache/skywalking/blob/4f0f39ffccdc9b41049903cc540b8904f7c9728e/
 # oap-server/server-bootstrap/src/main/resources/application.yml#L155-L158).
