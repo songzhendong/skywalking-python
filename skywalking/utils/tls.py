@@ -131,6 +131,10 @@ def _load_trusted_ca(path: Path) -> bytes:
     Raises OSError / ValueError when the file is unreadable, oversized, or not
     a CA bundle OpenSSL can load — callers degrade instead of handing garbage
     to gRPC / requests (which may only fail at connect time).
+
+    Returns ASCII PEM with only ``CERTIFICATE`` blocks extracted, so UTF-8 BOM
+    / preamble accepted by ``cafile`` remain usable for ``cadata`` and temp
+    verify files.
     """
     data = _read_bytes(path)
     try:
@@ -138,7 +142,7 @@ def _load_trusted_ca(path: Path) -> bytes:
     except OSError as exc:
         # ssl.SSLError subclasses OSError on CPython.
         raise ValueError(f'Invalid trusted CA PEM {path}: {exc}') from exc
-    return data
+    return _extract_pem_blocks(data, 'CERTIFICATE')
 
 
 def _validate_client_cert_key(cert_pem: bytes, key_pem: bytes) -> None:
@@ -185,6 +189,10 @@ def normalize_private_key_pem(key_pem: bytes) -> bytes:
 
     Passphrase-encrypted PEMs (PKCS#8 encrypted or legacy OpenSSL Proc-Type)
     are rejected with a clear error (not supported).
+
+    Only the bytes between the matching PKCS#1 BEGIN/END delimiters are
+    decoded — comments or ``openssl rsa -text`` preamble outside the block
+    must not corrupt the key (OpenSSL accepts such files).
     """
     text = key_pem.decode('utf-8', errors='ignore')
     if _ENCRYPTED_PEM_HEADER in text:
@@ -201,10 +209,14 @@ def normalize_private_key_pem(key_pem: bytes) -> bytes:
     if _PKCS1_PEM_HEADER not in text:
         return key_pem
 
-    body = text.replace(_PKCS1_PEM_HEADER, '').replace(_PKCS1_PEM_FOOTER, '')
+    start = text.find(_PKCS1_PEM_HEADER)
+    end = text.find(_PKCS1_PEM_FOOTER, start)
+    if start < 0 or end < 0:
+        raise ValueError('Invalid PKCS#1 private key PEM: missing BEGIN/END delimiters')
+    body = text[start + len(_PKCS1_PEM_HEADER):end]
     body = body.replace('\r', '').replace('\n', '').replace(' ', '')
     try:
-        pkcs1 = base64.b64decode(body)
+        pkcs1 = base64.b64decode(body, validate=False)
     except ValueError as exc:
         raise ValueError(f'Invalid PKCS#1 private key PEM: {exc}') from exc
 
@@ -227,6 +239,34 @@ def normalize_private_key_pem(key_pem: bytes) -> bytes:
     lines = [encoded[i:i + 64] for i in range(0, len(encoded), 64)]
     pem = _PKCS8_PEM_HEADER + '\n' + '\n'.join(lines) + '\n' + _PKCS8_PEM_FOOTER + '\n'
     return pem.encode('ascii')
+
+
+def _extract_pem_blocks(data: bytes, label: str) -> bytes:
+    """
+    Return ASCII PEM containing only ``BEGIN/END {label}`` blocks.
+
+    Strips UTF-8 BOM and ignores preamble/comments outside PEM delimiters so
+    OpenSSL-accepted files (BOM, UTF-8 comments) stay usable for ``cadata`` and
+    temp-file verify paths that require clean ASCII PEM.
+    """
+    text = data.decode('utf-8', errors='ignore').lstrip('\ufeff')
+    header = f'-----BEGIN {label}-----'
+    footer = f'-----END {label}-----'
+    blocks: List[str] = []
+    pos = 0
+    while True:
+        start = text.find(header, pos)
+        if start < 0:
+            break
+        end = text.find(footer, start)
+        if end < 0:
+            break
+        end += len(footer)
+        blocks.append(text[start:end].strip() + '\n')
+        pos = end
+    if not blocks:
+        raise ValueError(f'No {label} PEM block found')
+    return ''.join(blocks).encode('ascii')
 
 
 def _mtls_material(*, ca_usable: bool) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -282,20 +322,27 @@ def _mtls_material(*, ca_usable: bool) -> Tuple[Optional[bytes], Optional[bytes]
         return None, None
 
 
-# Keep mTLS temp PEM paths alive for the process (requests/ssl need file paths).
+# Keep mTLS / CA temp PEM paths alive for the process (requests/ssl need file paths).
 _mtls_temp_files: List[str] = []
 _mtls_file_cache_key: Optional[Tuple[bytes, bytes]] = None
 _mtls_file_cache: Optional[Tuple[str, str]] = None
+_ca_file_cache_key: Optional[bytes] = None
+_ca_file_cache: Optional[str] = None
 _atexit_registered = False
 
 
 def _cleanup_mtls_temp_files() -> None:
+    global _ca_file_cache, _ca_file_cache_key, _mtls_file_cache, _mtls_file_cache_key
     for path in list(_mtls_temp_files):
         try:
             os.unlink(path)
         except OSError:
             pass
     _mtls_temp_files.clear()
+    _mtls_file_cache = None
+    _mtls_file_cache_key = None
+    _ca_file_cache = None
+    _ca_file_cache_key = None
 
 
 def _after_fork_in_child() -> None:
@@ -307,9 +354,12 @@ def _after_fork_in_child() -> None:
     instead so the child's atexit handler cannot delete the parent's files.
     """
     global _mtls_temp_files, _mtls_file_cache, _mtls_file_cache_key
+    global _ca_file_cache, _ca_file_cache_key
     _mtls_temp_files = []
     _mtls_file_cache = None
     _mtls_file_cache_key = None
+    _ca_file_cache = None
+    _ca_file_cache_key = None
 
 
 if hasattr(os, 'register_at_fork'):
@@ -520,6 +570,21 @@ def collector_http_scheme() -> str:
         return 'https://' if config.agent_force_tls else 'http://'
 
 
+def _ca_verify_temp_file(root_certificates: bytes) -> str:
+    """Process-lifetime temp path for trusted CA bytes (survives K8s secret rotation)."""
+    global _ca_file_cache_key, _ca_file_cache
+    if (
+        _ca_file_cache is not None
+        and _ca_file_cache_key == root_certificates
+        and os.path.exists(_ca_file_cache)
+    ):
+        return _ca_file_cache
+    path = _pem_bytes_to_temp_file(root_certificates, '.crt')
+    _ca_file_cache_key = root_certificates
+    _ca_file_cache = path
+    return path
+
+
 def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
     """
     (verify, cert) for requests.Session.
@@ -530,35 +595,29 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
     Keeps the same enable/disable decision as grpc_ssl_credentials / tls_pem_material
     so an unreadable or oversized CA cannot leave HTTP on https:// with a bad verify path.
 
-    When custom CA bytes were loaded but the CA path is no longer readable (symlink
-    race), verify uses a process-local temp PEM of those bytes instead of silently
-    falling back to the system trust store.
+    Custom CA always uses a process-lifetime temp snapshot of the validated PEM
+    bytes (never the resolved symlink target), so Kubernetes secret rotation that
+    removes the old ``..data`` version cannot invalidate an already-configured
+    session.
 
     Temp-file failures drop client certs only (one-way TLS), with a warning.
     """
-    from skywalking import config
-
     material = tls_pem_material()
     if material is None:
         return True, None
 
     root_certificates, private_key, certificate_chain = material
-    ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
     if root_certificates is not None:
-        if ca_path is not None:
-            verify: object = str(ca_path)
-        else:
-            # Prefer in-memory CA over system trust when the path raced away.
-            try:
-                verify = _pem_bytes_to_temp_file(root_certificates, '.crt')
-            except OSError as exc:
-                _warn_once(
-                    f'requests-ca-temp:{exc}',
-                    'Failed to persist trusted CA temp file (%s); '
-                    'using process trust store for HTTP verify.',
-                    exc,
-                )
-                verify = True
+        try:
+            verify: object = _ca_verify_temp_file(root_certificates)
+        except OSError as exc:
+            _warn_once(
+                f'requests-ca-temp:{exc}',
+                'Failed to persist trusted CA temp file (%s); '
+                'using process trust store for HTTP verify.',
+                exc,
+            )
+            verify = True
     else:
         verify = True
 
@@ -599,8 +658,9 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
     - bad / unparsable custom CA without FORCE_TLS → plaintext (None)
     - bad client cert/key or temp-file failure → one-way TLS (CA or system trust)
 
-    Custom CA is loaded from in-memory PEM bytes (``cadata``) when present so a
-    path race after ``tls_pem_material`` cannot silently switch to system trust.
+    Custom CA is loaded from normalized in-memory PEM bytes (``cadata``) when
+    present so path races and UTF-8 BOM/preamble cannot drop the custom trust
+    store after ``tls_pem_material`` already accepted the CA.
     """
     from skywalking import config
 
@@ -616,9 +676,9 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
     ctx: Optional[ssl.SSLContext]
     if root_certificates is not None:
         try:
-            # cadata avoids re-reading the CA path (TOCTOU with K8s secret mounts).
+            # Normalized ASCII PEM from _load_trusted_ca (BOM/preamble stripped).
             ctx = ssl.create_default_context(
-                cadata=root_certificates.decode('ascii', errors='strict'),
+                cadata=root_certificates.decode('ascii'),
             )
         except (OSError, ValueError) as exc:
             # ssl.SSLError subclasses OSError; ValueError: non-ASCII PEM bytes.

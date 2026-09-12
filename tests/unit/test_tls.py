@@ -159,7 +159,13 @@ class TestCollectorTls(unittest.TestCase):
             self.assertTrue(collector_uses_tls())
             self.assertEqual(tls_pem_material(), (_TEST_CA_CERT, None, None))
             verify, cert = requests_tls_settings()
-            self.assertTrue(Path(verify).samefile(ca))
+            self.assertIsInstance(verify, str)
+            self.assertTrue(Path(verify).is_file())
+            self.assertFalse(Path(verify).samefile(ca))
+            self.assertEqual(
+                Path(verify).read_bytes(),
+                tls_mod._extract_pem_blocks(_TEST_CA_CERT, 'CERTIFICATE'),
+            )
             self.assertIsNone(cert)
 
     def test_missing_ca_path_warns_and_stays_plaintext(self):
@@ -184,7 +190,9 @@ class TestCollectorTls(unittest.TestCase):
             self.assertEqual(chain, _TEST_CLIENT_CERT)
             self.assertIn(b'BEGIN PRIVATE KEY', private_key)
             verify, pair = requests_tls_settings()
-            self.assertTrue(Path(verify).samefile(ca))
+            self.assertIsInstance(verify, str)
+            self.assertTrue(Path(verify).is_file())
+            self.assertFalse(Path(verify).samefile(ca))
             self.assertIsNotNone(pair)
             cert_file, key_file = pair
             self.assertEqual(Path(cert_file).read_bytes(), _TEST_CLIENT_CERT)
@@ -209,6 +217,28 @@ class TestCollectorTls(unittest.TestCase):
 
         pkcs8 = b'-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n'
         self.assertEqual(normalize_private_key_pem(pkcs8), pkcs8)
+
+    def test_normalize_pkcs1_ignores_preamble_outside_pem_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
+            crt = self._write_pem(tmp, 'client.crt', _TEST_CLIENT_CERT)
+            key = Path(tmp) / 'key.pem'
+            key.write_bytes(b'# This is a private key\n' + _TEST_CLIENT_KEY_PKCS1)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.load_cert_chain(crt, key)
+
+            normalized = normalize_private_key_pem(key.read_bytes())
+            normalized_path = Path(tmp) / 'normalized.pem'
+            normalized_path.write_bytes(normalized)
+            ctx.load_cert_chain(crt, normalized_path)  # must not raise
+
+            config.agent_ssl_trusted_ca_path = str(ca)
+            config.agent_ssl_cert_chain_path = str(crt)
+            config.agent_ssl_key_path = str(key)
+            roots, private_key, chain = tls_pem_material()
+            self.assertIsNotNone(roots)
+            self.assertIsNotNone(private_key)
+            self.assertIsNotNone(chain)
 
     def test_normalize_rejects_encrypted_private_key(self):
         encrypted = (
@@ -249,7 +279,9 @@ class TestCollectorTls(unittest.TestCase):
             self.assertNotIn(b'BEGIN RSA PRIVATE KEY', private_key)
 
             verify, pair = requests_tls_settings()
-            self.assertTrue(Path(verify).samefile(ca))
+            self.assertIsInstance(verify, str)
+            self.assertTrue(Path(verify).is_file())
+            self.assertFalse(Path(verify).samefile(ca))
             self.assertEqual(Path(pair[1]).read_bytes(), private_key)
 
     def test_missing_key_stays_one_way_tls(self):
@@ -420,7 +452,9 @@ class TestCollectorTls(unittest.TestCase):
                 material = tls_pem_material()
                 if material is not None and material[1] is not None:
                     verify, pair = requests_tls_settings()
-                    self.assertTrue(Path(verify).samefile(ca))
+                    # CA snapshot and client temps both need mkstemp; CA may fall
+                    # back to system trust when temp creation fails.
+                    self.assertTrue(verify is True or (isinstance(verify, str) and Path(verify).is_file()))
                     self.assertIsNone(pair)
                 else:
                     self.assertEqual(material, (_TEST_CA_CERT, None, None))
@@ -485,6 +519,58 @@ class TestCollectorTls(unittest.TestCase):
             self.assertTrue(any('mTLS is disabled' in line for line in logs.output))
             self.assertEqual(collector_http_scheme(), 'http://')
 
+    def test_requests_verify_survives_k8s_style_ca_rotation(self):
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for version in ('v1', 'v2'):
+                (root / version).mkdir()
+                (root / version / 'ca.crt').write_bytes(_TEST_CA_CERT)
+            try:
+                (root / '..data').symlink_to('v1')
+                ca = root / 'ca.crt'
+                ca.symlink_to(Path('..data') / 'ca.crt')
+            except OSError:
+                self.skipTest('symlinks not available')
+            if tls_mod.ssl_file_path(str(ca)) is None:
+                self.skipTest('symlink CA path not readable as regular file')
+            config.agent_ssl_trusted_ca_path = str(ca)
+
+            verify, _cert = requests_tls_settings()
+            self.assertIsInstance(verify, str)
+            self.assertTrue(Path(verify).is_file())
+            stored = Path(verify)
+
+            try:
+                (root / '..data-next').symlink_to('v2')
+                os.replace(root / '..data-next', root / '..data')
+                shutil.rmtree(root / 'v1')
+            except OSError:
+                self.skipTest('symlink rotation not available')
+            self.assertEqual(ca.read_bytes(), _TEST_CA_CERT)
+            self.assertTrue(stored.is_file())
+            self.assertEqual(
+                stored.read_bytes(),
+                tls_mod._extract_pem_blocks(_TEST_CA_CERT, 'CERTIFICATE'),
+            )
+
+    def test_aio_context_accepts_bom_and_utf8_preamble_ca(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = Path(tmp) / 'ca.crt'
+            config.agent_ssl_trusted_ca_path = str(ca)
+            for label, prefix in [
+                ('plain', b''),
+                ('bom', b'\xef\xbb\xbf'),
+                ('utf8-comment', '# 注释\n'.encode('utf-8')),
+            ]:
+                ca.write_bytes(prefix + _TEST_CA_CERT)
+                ssl.create_default_context(cafile=str(ca))
+                tls_mod._warned_keys.clear()
+                self.assertEqual(collector_http_scheme(), 'https://', label)
+                ctx = ssl_context_for_collector()
+                self.assertIsInstance(ctx, ssl.SSLContext, label)
+
     def test_create_default_context_oserror_degrades(self):
         with tempfile.TemporaryDirectory() as tmp:
             ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
@@ -547,18 +633,22 @@ class TestCollectorTls(unittest.TestCase):
             parent_list = tls_mod._mtls_temp_files
             cert_file, key_file = pair
             self.assertTrue(parent_list)
+            self.assertIn(cert_file, parent_list)
+            self.assertIn(key_file, parent_list)
             self.assertTrue(os.path.exists(cert_file))
 
             tls_mod._after_fork_in_child()
             self.assertIsNot(tls_mod._mtls_temp_files, parent_list)
             self.assertEqual(tls_mod._mtls_temp_files, [])
             self.assertIsNone(tls_mod._mtls_file_cache)
+            self.assertIsNone(tls_mod._ca_file_cache)
             # Simulate child atexit against the rebound empty list.
             tls_mod._cleanup_mtls_temp_files()
             self.assertTrue(os.path.exists(cert_file))
             self.assertTrue(os.path.exists(key_file))
             # Parent still holds the original list object with live paths.
-            self.assertEqual(parent_list, list(pair))
+            self.assertIn(cert_file, parent_list)
+            self.assertIn(key_file, parent_list)
             # Restore parent bookkeeping so tearDown can unlink temps.
             tls_mod._mtls_temp_files = parent_list
             tls_mod._mtls_file_cache = pair
@@ -566,6 +656,9 @@ class TestCollectorTls(unittest.TestCase):
                 Path(cert_file).read_bytes(),
                 Path(key_file).read_bytes(),
             )
+            if _verify is not True and isinstance(_verify, str):
+                tls_mod._ca_file_cache = _verify
+                tls_mod._ca_file_cache_key = Path(_verify).read_bytes()
 
     @unittest.skipUnless(hasattr(os, 'fork'), 'os.fork required')
     def test_fork_child_exit_does_not_delete_parent_mtls_temps(self):
