@@ -164,7 +164,7 @@ class TestCollectorTls(unittest.TestCase):
             self.assertFalse(Path(verify).samefile(ca))
             self.assertEqual(
                 Path(verify).read_bytes(),
-                tls_mod._extract_pem_blocks(_TEST_CA_CERT, 'CERTIFICATE'),
+                tls_mod._extract_ca_pem_blocks(_TEST_CA_CERT),
             )
             self.assertIsNone(cert)
 
@@ -452,13 +452,13 @@ class TestCollectorTls(unittest.TestCase):
                 material = tls_pem_material()
                 if material is not None and material[1] is not None:
                     verify, pair = requests_tls_settings()
-                    # CA snapshot and client temps both need mkstemp; CA may fall
-                    # back to system trust when temp creation fails.
+                    # CA snapshot may fall back to the configured path; client temps fail.
                     self.assertTrue(verify is True or (isinstance(verify, str) and Path(verify).is_file()))
                     self.assertIsNone(pair)
                 else:
                     self.assertEqual(material, (_TEST_CA_CERT, None, None))
-            self.assertTrue(any('mTLS' in line or 'temp files' in line for line in logs.output))
+            self.assertTrue(any('mTLS' in line or 'temp files' in line or 'configured CA path' in line
+                                for line in logs.output))
 
     def test_configure_requests_session_never_raises(self):
         config.agent_force_tls = True
@@ -552,8 +552,83 @@ class TestCollectorTls(unittest.TestCase):
             self.assertTrue(stored.is_file())
             self.assertEqual(
                 stored.read_bytes(),
-                tls_mod._extract_pem_blocks(_TEST_CA_CERT, 'CERTIFICATE'),
+                tls_mod._extract_ca_pem_blocks(_TEST_CA_CERT),
             )
+
+    def test_extract_ca_pem_blocks_preserves_trusted_label(self):
+        mixed = (
+            b'\xef\xbb\xbf# preamble \xe6\xb3\xa8\xe9\x87\x8a\n'
+            b'-----BEGIN TRUSTED CERTIFICATE-----\n'
+            b'THJ1c3RlZA==\n'
+            b'-----END TRUSTED CERTIFICATE-----\n'
+            b'-----BEGIN CERTIFICATE-----\n'
+            b'Y2VydA==\n'
+            b'-----END CERTIFICATE-----\n'
+        )
+        out = tls_mod._extract_ca_pem_blocks(mixed)
+        self.assertTrue(out.startswith(b'-----BEGIN TRUSTED CERTIFICATE-----'))
+        self.assertIn(b'-----BEGIN CERTIFICATE-----', out)
+        self.assertIn(b'THJ1c3RlZA==', out)
+        self.assertNotIn(b'preamble', out)
+        self.assertNotIn('\ufeff'.encode('utf-8'), out)
+
+    def test_requests_ca_temp_failure_falls_back_to_configured_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
+            config.agent_ssl_trusted_ca_path = str(ca)
+            resolved = tls_mod.ssl_file_path(str(ca))
+            self.assertIsNotNone(resolved)
+
+            def boom(*_a, **_k):
+                raise OSError(30, 'Read-only file system')
+
+            with patch('tempfile.mkstemp', side_effect=boom), \
+                    self.assertLogs('skywalking', level='WARNING') as logs:
+                verify, cert = requests_tls_settings()
+            self.assertIsInstance(verify, str)
+            self.assertTrue(Path(verify).samefile(resolved))
+            self.assertIsNone(cert)
+            self.assertTrue(any('configured CA path' in line for line in logs.output))
+
+    def test_trusted_certificate_pem_enables_sync_http_tls(self):
+        import shutil
+        import subprocess
+
+        if shutil.which('openssl') is None:
+            self.skipTest('openssl not available')
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = Path(tmp) / 'ca.pem'
+            trusted = Path(tmp) / 'trusted.pem'
+            ca.write_bytes(_TEST_CA_CERT)
+            try:
+                subprocess.run(
+                    [
+                        'openssl', 'x509', '-in', str(ca), '-addtrust', 'serverAuth',
+                        '-trustout', '-out', str(trusted),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f'openssl trustout failed: {exc}')
+            text = trusted.read_text(encoding='ascii', errors='ignore')
+            self.assertIn('BEGIN TRUSTED CERTIFICATE', text)
+            ssl.create_default_context(cafile=str(trusted))
+            config.agent_ssl_trusted_ca_path = str(trusted)
+            material = tls_pem_material()
+            self.assertIsNotNone(material)
+            roots, private_key, chain = material
+            self.assertIsNotNone(roots)
+            self.assertIn(b'BEGIN TRUSTED CERTIFICATE', roots)
+            self.assertNotIn(b'-----BEGIN CERTIFICATE-----', roots)
+            self.assertIsNone(private_key)
+            self.assertIsNone(chain)
+            self.assertEqual(collector_http_scheme(), 'https://')
+            verify, cert = requests_tls_settings()
+            self.assertIsInstance(verify, str)
+            self.assertTrue(Path(verify).is_file())
+            self.assertIn(b'BEGIN TRUSTED CERTIFICATE', Path(verify).read_bytes())
+            self.assertIsNone(cert)
 
     def test_aio_context_accepts_bom_and_utf8_preamble_ca(self):
         with tempfile.TemporaryDirectory() as tmp:

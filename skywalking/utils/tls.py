@@ -132,9 +132,9 @@ def _load_trusted_ca(path: Path) -> bytes:
     a CA bundle OpenSSL can load — callers degrade instead of handing garbage
     to gRPC / requests (which may only fail at connect time).
 
-    Returns ASCII PEM with only ``CERTIFICATE`` blocks extracted, so UTF-8 BOM
-    / preamble accepted by ``cafile`` remain usable for ``cadata`` and temp
-    verify files.
+    Returns ASCII PEM with ``CERTIFICATE`` and/or ``TRUSTED CERTIFICATE`` blocks
+    extracted (labels and trust attributes preserved). UTF-8 BOM / preamble
+    accepted by ``cafile`` stay usable for ``cadata`` and temp verify files.
     """
     data = _read_bytes(path)
     try:
@@ -142,7 +142,7 @@ def _load_trusted_ca(path: Path) -> bytes:
     except OSError as exc:
         # ssl.SSLError subclasses OSError on CPython.
         raise ValueError(f'Invalid trusted CA PEM {path}: {exc}') from exc
-    return _extract_pem_blocks(data, 'CERTIFICATE')
+    return _extract_ca_pem_blocks(data)
 
 
 def _validate_client_cert_key(cert_pem: bytes, key_pem: bytes) -> None:
@@ -267,6 +267,41 @@ def _extract_pem_blocks(data: bytes, label: str) -> bytes:
     if not blocks:
         raise ValueError(f'No {label} PEM block found')
     return ''.join(blocks).encode('ascii')
+
+
+# OpenSSL ``openssl x509 -trustout`` emits TRUSTED CERTIFICATE (with trust
+# auxiliary). Keep that label — do not relabel as CERTIFICATE.
+_CA_PEM_LABELS = ('TRUSTED CERTIFICATE', 'CERTIFICATE')
+
+
+def _extract_ca_pem_blocks(data: bytes) -> bytes:
+    """
+    Return ASCII PEM with ``CERTIFICATE`` / ``TRUSTED CERTIFICATE`` blocks only.
+
+    Preserves each block's PEM label and trust attributes. Strips UTF-8 BOM and
+    ignores preamble outside delimiters. ``TRUSTED CERTIFICATE`` is searched
+    first so its header is not confused with plain ``CERTIFICATE``.
+    """
+    text = data.decode('utf-8', errors='ignore').lstrip('\ufeff')
+    found: List[Tuple[int, str]] = []
+    for label in _CA_PEM_LABELS:
+        header = f'-----BEGIN {label}-----'
+        footer = f'-----END {label}-----'
+        pos = 0
+        while True:
+            start = text.find(header, pos)
+            if start < 0:
+                break
+            end = text.find(footer, start)
+            if end < 0:
+                break
+            end += len(footer)
+            found.append((start, text[start:end].strip() + '\n'))
+            pos = end
+    if not found:
+        raise ValueError('No CERTIFICATE or TRUSTED CERTIFICATE PEM block found')
+    found.sort(key=lambda item: item[0])
+    return ''.join(block for _, block in found).encode('ascii')
 
 
 def _mtls_material(*, ca_usable: bool) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -595,13 +630,17 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
     Keeps the same enable/disable decision as grpc_ssl_credentials / tls_pem_material
     so an unreadable or oversized CA cannot leave HTTP on https:// with a bad verify path.
 
-    Custom CA always uses a process-lifetime temp snapshot of the validated PEM
-    bytes (never the resolved symlink target), so Kubernetes secret rotation that
+    Custom CA prefers a process-lifetime temp snapshot of the validated PEM bytes
+    (never the resolved symlink target), so Kubernetes secret rotation that
     removes the old ``..data`` version cannot invalidate an already-configured
-    session.
+    session. If the snapshot cannot be written (e.g. read-only temp dir), fall
+    back to the still-readable configured CA path rather than discarding the
+    private CA for Requests' default trust store.
 
-    Temp-file failures drop client certs only (one-way TLS), with a warning.
+    Client-cert temp-file failures drop mTLS only (one-way TLS), with a warning.
     """
+    from skywalking import config
+
     material = tls_pem_material()
     if material is None:
         return True, None
@@ -611,13 +650,23 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
         try:
             verify: object = _ca_verify_temp_file(root_certificates)
         except OSError as exc:
-            _warn_once(
-                f'requests-ca-temp:{exc}',
-                'Failed to persist trusted CA temp file (%s); '
-                'using process trust store for HTTP verify.',
-                exc,
-            )
-            verify = True
+            ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
+            if ca_path is not None:
+                _warn_once(
+                    f'requests-ca-temp:{exc}',
+                    'Failed to persist trusted CA temp file (%s); '
+                    'falling back to configured CA path for HTTP verify.',
+                    exc,
+                )
+                verify = str(ca_path)
+            else:
+                _warn_once(
+                    f'requests-ca-temp:{exc}',
+                    'Failed to persist trusted CA temp file (%s); '
+                    'using process trust store for HTTP verify.',
+                    exc,
+                )
+                verify = True
     else:
         verify = True
 
@@ -675,19 +724,38 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
 
     ctx: Optional[ssl.SSLContext]
     if root_certificates is not None:
+        load_exc: Optional[BaseException] = None
         try:
             # Normalized ASCII PEM from _load_trusted_ca (BOM/preamble stripped).
+            # Plain CERTIFICATE works via cadata; TRUSTED CERTIFICATE often needs cafile.
             ctx = ssl.create_default_context(
                 cadata=root_certificates.decode('ascii'),
             )
         except (OSError, ValueError) as exc:
+            load_exc = exc
+            ctx = None
+            try:
+                cafile = _ca_verify_temp_file(root_certificates)
+                ctx = ssl.create_default_context(cafile=cafile)
+                load_exc = None
+            except OSError as temp_exc:
+                load_exc = temp_exc
+                ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
+                if ca_path is not None:
+                    try:
+                        ctx = ssl.create_default_context(cafile=str(ca_path))
+                        load_exc = None
+                    except OSError as path_exc:
+                        load_exc = path_exc
+                        ctx = None
+        if load_exc is not None:
             # ssl.SSLError subclasses OSError; ValueError: non-ASCII PEM bytes.
             if config.agent_force_tls:
                 _warn_once(
-                    f'ssl-ctx-ca:{exc}',
+                    f'ssl-ctx-ca:{load_exc}',
                     'Failed to load trusted CA into SSLContext (%s); continuing with '
                     'FORCE_TLS and the process trust store (mTLS disabled).',
-                    exc,
+                    load_exc,
                 )
                 try:
                     ctx = _system_trust_context()
@@ -703,10 +771,10 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
                 certificate_chain = None
             else:
                 _warn_once(
-                    f'ssl-ctx-ca-plain:{exc}',
+                    f'ssl-ctx-ca-plain:{load_exc}',
                     'Failed to load trusted CA into SSLContext (%s); collector stays '
                     'plaintext (set SW_AGENT_FORCE_TLS to use the process trust store).',
-                    exc,
+                    load_exc,
                 )
                 return None
     else:
