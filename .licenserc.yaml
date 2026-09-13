@@ -29,6 +29,7 @@ header:
     - 'NOTICE'
     - '.github/PULL_REQUEST_TEMPLATE'
     - '.gitignore'
+    - '.gitattributes'
     - '**/*.json'
     - '.venv'
     - 'poetry.lock'
