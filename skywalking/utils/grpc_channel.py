@@ -29,7 +29,8 @@ Multi-backend design (aligned with skywalking-nodejs native failover):
 - Hostnames in a multi list are resolved once at channel build (grpcio cannot
   keep a literal hostname in ipv4:/ipv6:). No periodic DNS re-resolve for multi.
 - pick_first shuffleAddressList is on (per-process random preferred backend).
-  Channel target / grpc.default_authority still follow config order (TLS SAN).
+  Dial uses the encoded channel target; grpc.default_authority (and thus TLS
+  peer-name checks when that arg is set) still follow the first configured endpoint.
 - Invalid entries are logged and dropped; never silently ignored without a log.
 - HTTP proxy disabled; keepalive channel options intentionally omitted (OAP conflict).
 - Unary and sync streaming RPCs use a deadline (Node 10s floor, always >
@@ -60,6 +61,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import grpc
 
 from skywalking.loggings import logger
+from skywalking.utils.tls import grpc_ssl_credentials
 
 # Retry only unary idempotent reportInstanceProperties (Node service_config parity).
 # Client-streaming collect must NOT be retried — replay would duplicate segments.
@@ -402,7 +404,8 @@ def prepare_grpc_channel_endpoints(
     Build (channel_target, default_authority) from parsed backends.
 
     Authority prefers the first *usable* original entry's host:port (hostname kept
-    for TLS SAN when that name resolved). Never points at a hostname that DNS skipped.
+    for :authority / TLS peer-name when that name resolved). Never points at a
+    hostname that DNS skipped.
     """
     if not addresses:
         raise ValueError(
@@ -501,21 +504,22 @@ def resolve_grpc_target(services: Optional[str] = None) -> str:
 def _channel_options(default_authority: str) -> Tuple[Tuple[str, int | str], ...]:
     options = list(GRPC_CHANNEL_OPTIONS)
     # Align with Node sw-static getDefaultAuthority (first usable backend).
+    # :authority and TLS peer-name (when this arg is set) use host:port here —
+    # do not set grpc.ssl_target_name_override (test-only / special dial cases).
     options.append(('grpc.default_authority', default_authority))
     return tuple(options)
 
 
 def create_sync_channel():
     """Create one sync gRPC channel (caller may wrap with auth interceptor)."""
-    from skywalking import config
-
     target, authority = _resolve_channel_target_and_authority()
-    options = _channel_options(authority)
-    logger.info('Creating gRPC channel to collector target %s (authority=%s)', target, authority)
     with agent_collector_channel_scope():
         try:
-            if config.agent_force_tls:
-                channel = grpc.secure_channel(target, grpc.ssl_channel_credentials(), options=options)
+            credentials = grpc_ssl_credentials()
+            options = _channel_options(authority)
+            logger.info('Creating gRPC channel to collector target %s (authority=%s)', target, authority)
+            if credentials is not None:
+                channel = grpc.secure_channel(target, credentials, options=options)
             else:
                 channel = grpc.insecure_channel(target, options=options)
         except Exception:  # noqa: BLE001 - never fail host process start
@@ -523,23 +527,22 @@ def create_sync_channel():
                 'Failed to create gRPC channel to %s; using localhost:1 placeholder',
                 target,
             )
-            channel = grpc.insecure_channel('localhost:1', options=options)
+            channel = grpc.insecure_channel('localhost:1', options=_channel_options(authority))
         return mark_agent_collector_channel(channel)
 
 
 def create_aio_channel(interceptors=None):
     """Create one aio gRPC channel with optional interceptors."""
-    from skywalking import config
-
     target, authority = _resolve_channel_target_and_authority()
-    options = _channel_options(authority)
-    logger.info('Creating aio gRPC channel to collector target %s (authority=%s)', target, authority)
     with agent_collector_channel_scope():
         try:
-            if config.agent_force_tls:
+            credentials = grpc_ssl_credentials()
+            options = _channel_options(authority)
+            logger.info('Creating aio gRPC channel to collector target %s (authority=%s)', target, authority)
+            if credentials is not None:
                 channel = grpc.aio.secure_channel(
                     target,
-                    grpc.ssl_channel_credentials(),
+                    credentials,
                     options=options,
                     interceptors=interceptors,
                 )
@@ -550,7 +553,9 @@ def create_aio_channel(interceptors=None):
                 'Failed to create aio gRPC channel to %s; using localhost:1 placeholder',
                 target,
             )
-            channel = grpc.aio.insecure_channel('localhost:1', options=options, interceptors=interceptors)
+            channel = grpc.aio.insecure_channel(
+                'localhost:1', options=_channel_options(authority), interceptors=interceptors,
+            )
         return mark_agent_collector_channel(channel)
 
 

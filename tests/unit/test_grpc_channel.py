@@ -280,12 +280,13 @@ class TestGrpcBackendAddress(unittest.TestCase):
 
             with patch('skywalking.utils.grpc_channel.socket.getaddrinfo', side_effect=fake_getaddrinfo), \
                  patch('skywalking.utils.grpc_channel.grpc.secure_channel') as secure, \
-                 patch('skywalking.utils.grpc_channel.grpc.ssl_channel_credentials', return_value='creds'):
+                 patch('skywalking.utils.grpc_channel.grpc_ssl_credentials', return_value='creds'):
                 create_sync_channel()
             args, kwargs = secure.call_args
             self.assertEqual(args[0], 'ipv4:10.0.0.1:11800,10.0.0.2:11800')
             opts = dict(kwargs['options'])
             self.assertEqual(opts['grpc.default_authority'], 'oap.example:11800')
+            self.assertNotIn('grpc.ssl_target_name_override', opts)
         finally:
             config.agent_collector_backend_services = previous
             config.agent_force_tls = previous_tls

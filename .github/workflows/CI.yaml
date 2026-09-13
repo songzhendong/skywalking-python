@@ -254,6 +254,10 @@ jobs:
         case:
           - name: gRPC-single-process
             path: tests/e2e/case/grpc/single/e2e.yaml
+          - name: gRPC-ssl
+            path: tests/e2e/case/grpc/ssl/e2e.yaml
+          - name: gRPC-mtls
+            path: tests/e2e/case/grpc/mtls/e2e.yaml
           - name: gRPC-gunicorn
             path: tests/e2e/case/grpc/gunicorn/e2e.yaml
           # - name: gRPC-uwsgi
