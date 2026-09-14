@@ -42,7 +42,7 @@ agent.start()
 Implementation notes (maintainers / operators):
 
 - Mixed IPv4/IPv6 stays in one list; IPv4 is encoded as IPv4-mapped IPv6 for grpcio so `pick_first` can try both families.
-- Multi-hostname lists are DNS-expanded once at channel build (about 5s lookup budget per name); there is no periodic re-resolve — prefer a single address or stable IPs when DNS changes.
+- Multi-hostname lists are DNS-expanded at channel build (about 5s lookup budget per name). With `agent_collector_is_resolve_dns_periodically=true` (env `SW_AGENT_COLLECTOR_IS_RESOLVE_DNS_PERIODICALLY`), hostnames — including a single hostname — are expanded to static IPs and re-checked every `agent_collector_grpc_channel_check_interval` seconds (default 30, Java `collector.grpc_channel_check_interval`). Any change to the expanded IP set (grow or shrink) rebuilds the whole pick_first channel (Python does not use Java's single-index reconnect manager). A transient failure of any configured hostname keeps the previous dial plan instead of shrinking the static set.
 - Channel `:authority` / TLS SAN uses `grpc.default_authority` = the first configured endpoint (before shuffle). With `agent_force_tls`, every backend cert must cover that authority.
 - Reporters wait until the channel is READY; non-READY skips the RPC rather than failing fast into a black hole.
 - After a silent backend switch that stays READY, instance properties are re-reported on the normal properties period so the new OAP learns the instance.
