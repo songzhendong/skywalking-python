@@ -142,6 +142,12 @@ correlation_value_max_length: int = int(os.getenv('SW_CORRELATION_VALUE_MAX_LENG
 agent_profile_active: bool = os.getenv('SW_AGENT_PROFILE_ACTIVE', '').lower() != 'false'
 # The number of seconds between two profile task query.
 agent_collector_get_profile_task_interval: int = int(os.getenv('SW_AGENT_COLLECTOR_GET_PROFILE_TASK_INTERVAL', '20'))
+# Seconds between CDS (Configuration Discovery Service) polls for dynamic agent
+# config such as agent.sample_n_per_3_secs. gRPC protocol only (Java
+# collector.get_agent_dynamic_config_interval).
+agent_collector_get_agent_dynamic_config_interval: int = int(
+    os.getenv('SW_AGENT_COLLECTOR_GET_AGENT_DYNAMIC_CONFIG_INTERVAL', '20')
+)
 # The number of parallel monitor segment count.
 agent_profile_max_parallel: int = int(os.getenv('SW_AGENT_PROFILE_MAX_PARALLEL', '5'))
 # The maximum monitor segment time(minutes), if current segment monitor time out of limit, then stop it.
@@ -223,7 +229,8 @@ plugin_celery_parameters_length: int = int(os.getenv('SW_PLUGIN_CELERY_PARAMETER
 plugin_grpc_ignored_methods: str = os.getenv('SW_PLUGIN_GRPC_IGNORED_METHODS', '').upper()
 
 # BEGIN: Sampling Configurations
-# The number of samples to take in every 3 seconds, 0 turns off
+# The number of samples to take in every 3 seconds, 0 turns off. Bootstrap value;
+# gRPC CDS may override agent.sample_n_per_3_secs at runtime without restart.
 sample_n_per_3_secs: int = int(os.getenv('SW_SAMPLE_N_PER_3_SECS', '0'))
 
 # THIS MUST FOLLOW DIRECTLY AFTER LIST OF CONFIG OPTIONS!

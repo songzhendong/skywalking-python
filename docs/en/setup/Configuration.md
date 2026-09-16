@@ -59,6 +59,7 @@ export SW_AGENT_YourConfiguration=YourValue
 | :------------ | :------------ | :------------ | :------------ | :------------ |
 | agent_profile_active | SW_AGENT_PROFILE_ACTIVE | <class 'bool'> | True | If `True`, Python agent will enable profiler when user create a new profiling task. |
 | agent_collector_get_profile_task_interval | SW_AGENT_COLLECTOR_GET_PROFILE_TASK_INTERVAL | <class 'int'> | 20 | The number of seconds between two profile task query. |
+| agent_collector_get_agent_dynamic_config_interval | SW_AGENT_COLLECTOR_GET_AGENT_DYNAMIC_CONFIG_INTERVAL | <class 'int'> | 20 | Seconds between CDS (Configuration Discovery Service) polls for dynamic agent config such as agent.sample_n_per_3_secs. gRPC protocol only (Java collector.get_agent_dynamic_config_interval). |
 | agent_profile_max_parallel | SW_AGENT_PROFILE_MAX_PARALLEL | <class 'int'> | 5 | The number of parallel monitor segment count. |
 | agent_profile_duration | SW_AGENT_PROFILE_DURATION | <class 'int'> | 10 | The maximum monitor segment time(minutes), if current segment monitor time out of limit, then stop it. |
 | agent_profile_dump_max_stack_depth | SW_AGENT_PROFILE_DUMP_MAX_STACK_DEPTH | <class 'int'> | 500 | The number of max dump thread stack depth |
@@ -101,4 +102,4 @@ export SW_AGENT_YourConfiguration=YourValue
 ###  Sampling Configurations
 | Configuration | Environment Variable | Type | Default Value | Description |
 | :------------ | :------------ | :------------ | :------------ | :------------ |
-| sample_n_per_3_secs | SW_SAMPLE_N_PER_3_SECS | <class 'int'> | 0 | The number of samples to take in every 3 seconds, 0 turns off |
+| sample_n_per_3_secs | SW_SAMPLE_N_PER_3_SECS | <class 'int'> | 0 | The number of samples to take in every 3 seconds, 0 turns off. Bootstrap value; gRPC CDS may override agent.sample_n_per_3_secs at runtime without restart. |

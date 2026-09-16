@@ -245,3 +245,15 @@ class ProfileTaskChannelServiceAsync(ServiceAsync):
     @abstractmethod
     async def report(self, generator):
         raise NotImplementedError()
+
+
+class ConfigurationDiscoveryChannelService(Service):
+    @abstractmethod
+    def sync(self):
+        raise NotImplementedError()
+
+
+class ConfigurationDiscoveryChannelServiceAsync(ServiceAsync):
+    @abstractmethod
+    async def sync(self):
+        raise NotImplementedError()
