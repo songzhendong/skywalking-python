@@ -576,8 +576,6 @@ class TestCollectorTls(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
             config.agent_ssl_trusted_ca_path = str(ca)
-            resolved = tls_mod.ssl_file_path(str(ca))
-            self.assertIsNotNone(resolved)
 
             def boom(*_a, **_k):
                 raise OSError(30, 'Read-only file system')
@@ -586,9 +584,52 @@ class TestCollectorTls(unittest.TestCase):
                     self.assertLogs('skywalking', level='WARNING') as logs:
                 verify, cert = requests_tls_settings()
             self.assertIsInstance(verify, str)
-            self.assertTrue(Path(verify).samefile(resolved))
+            # Unresolved configured path (absolute), not a deleted resolve() target.
+            self.assertEqual(Path(verify), Path(ca).expanduser().absolute())
+            self.assertTrue(Path(verify).is_file())
             self.assertIsNone(cert)
             self.assertTrue(any('configured CA path' in line for line in logs.output))
+
+    def test_requests_ca_temp_failure_keeps_symlink_across_k8s_rotation(self):
+        """No-temp fallback + K8s secret rotation must keep the configured symlink."""
+        import shutil
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for version in ('v1', 'v2'):
+                (root / version).mkdir()
+                (root / version / 'ca.crt').write_bytes(_TEST_CA_CERT)
+            try:
+                (root / '..data').symlink_to('v1')
+                ca = root / 'ca.crt'
+                ca.symlink_to(Path('..data') / 'ca.crt')
+            except OSError:
+                self.skipTest('symlinks not available')
+            if tls_mod.ssl_file_path(str(ca)) is None:
+                self.skipTest('symlink CA path not readable as regular file')
+            config.agent_ssl_trusted_ca_path = str(ca)
+
+            def boom(*_a, **_k):
+                raise OSError(30, 'Read-only file system')
+
+            with patch('tempfile.mkstemp', side_effect=boom), \
+                    self.assertLogs('skywalking', level='WARNING'):
+                verify, _cert = requests_tls_settings()
+            self.assertIsInstance(verify, str)
+            stored = Path(verify)
+            # Must be the configured symlink, not the resolved v1/ target.
+            self.assertEqual(stored, ca.expanduser().absolute())
+            self.assertNotEqual(stored.parent.name, 'v1')
+
+            try:
+                (root / '..data-next').symlink_to('v2')
+                os.replace(root / '..data-next', root / '..data')
+                shutil.rmtree(root / 'v1')
+            except OSError:
+                self.skipTest('symlink rotation not available')
+            self.assertEqual(ca.read_bytes(), _TEST_CA_CERT)
+            self.assertTrue(stored.is_file())
+            self.assertEqual(stored.read_bytes(), _TEST_CA_CERT)
 
     def test_trusted_certificate_pem_enables_sync_http_tls(self):
         import shutil
@@ -629,6 +670,89 @@ class TestCollectorTls(unittest.TestCase):
             self.assertTrue(Path(verify).is_file())
             self.assertIn(b'BEGIN TRUSTED CERTIFICATE', Path(verify).read_bytes())
             self.assertIsNone(cert)
+
+    def test_aio_mixed_trusted_and_certificate_bundle_uses_cafile(self):
+        """cadata must not silently drop TRUSTED blocks from a mixed CA bundle."""
+        import shutil
+        import subprocess
+
+        if shutil.which('openssl') is None:
+            self.skipTest('openssl not available')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ca = root / 'ca.pem'
+            cert = root / 'server.pem'
+            trusted = root / 'trusted.pem'
+            bundle = root / 'bundle.pem'
+            ca.write_bytes(_TEST_CA_CERT)
+            cert.write_bytes(_TEST_CLIENT_CERT)
+            try:
+                subprocess.run(
+                    [
+                        'openssl', 'x509', '-in', str(cert), '-addtrust', 'serverAuth',
+                        '-trustout', '-out', str(trusted),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                self.skipTest(f'openssl trustout failed: {exc}')
+            bundle.write_bytes(trusted.read_bytes() + ca.read_bytes())
+            direct = ssl.create_default_context(cafile=str(bundle))
+            self.assertGreaterEqual(direct.cert_store_stats()['x509'], 2)
+
+            config.agent_ssl_trusted_ca_path = str(bundle)
+            material = tls_pem_material()
+            self.assertIsNotNone(material)
+            roots = material[0]
+            self.assertIn(b'BEGIN TRUSTED CERTIFICATE', roots)
+            self.assertIn(b'BEGIN CERTIFICATE', roots)
+            self.assertTrue(tls_mod._ca_pem_has_trusted_certificate(roots))
+
+            # Prove cadata alone would under-load the mixed bundle.
+            cadata_only = ssl.create_default_context(cadata=roots.decode('ascii'))
+            self.assertLess(
+                cadata_only.cert_store_stats()['x509'],
+                direct.cert_store_stats()['x509'],
+            )
+
+            ctx = ssl_context_for_collector()
+            self.assertIsInstance(ctx, ssl.SSLContext)
+            self.assertEqual(
+                ctx.cert_store_stats()['x509'],
+                direct.cert_store_stats()['x509'],
+            )
+
+    def test_ssl_context_skips_cadata_when_trusted_label_present(self):
+        """Control-flow guard: TRUSTED marker forces cafile (no openssl required)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
+            config.agent_ssl_trusted_ca_path = str(ca)
+            mixed = (
+                b'-----BEGIN TRUSTED CERTIFICATE-----\n'
+                b'MIIB\n'
+                b'-----END TRUSTED CERTIFICATE-----\n'
+            ) + _TEST_CA_CERT
+            self.assertTrue(tls_mod._ca_pem_has_trusted_certificate(mixed))
+            calls = []
+            real_cdc = ssl.create_default_context
+
+            def spy(*_a, **kwargs):
+                calls.append(dict(kwargs))
+                if 'cadata' in kwargs:
+                    raise AssertionError(
+                        'cadata must not be used when TRUSTED CERTIFICATE is present'
+                    )
+                # Load a known-good CA file regardless of the snapshot path.
+                return real_cdc(cafile=str(ca))
+
+            with patch.object(tls_mod, 'tls_pem_material', return_value=(mixed, None, None)), \
+                    patch.object(tls_mod, '_ca_verify_temp_file', return_value=str(ca)), \
+                    patch('ssl.create_default_context', side_effect=spy):
+                ctx = ssl_context_for_collector()
+            self.assertIsInstance(ctx, ssl.SSLContext)
+            self.assertTrue(any('cafile' in c for c in calls))
+            self.assertFalse(any('cadata' in c for c in calls))
 
     def test_aio_context_accepts_bom_and_utf8_preamble_ca(self):
         with tempfile.TemporaryDirectory() as tmp:

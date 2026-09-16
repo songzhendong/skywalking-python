@@ -620,6 +620,34 @@ def _ca_verify_temp_file(root_certificates: bytes) -> str:
     return path
 
 
+def _configured_ca_path_for_verify() -> Optional[str]:
+    """
+    Absolute, expanduser'd configured CA path **without** resolving symlinks.
+
+    Validates that a regular file is reachable (via ``ssl_file_path``), but
+    returns the configured path so Kubernetes ``ca.crt -> ..data/ca.crt`` stays
+    stable across secret rotation when a temp CA snapshot cannot be written.
+    ``ssl_file_path`` / ``Path.resolve`` would pin ``session.verify`` to a
+    versioned ``v1/`` target that rotation deletes.
+    """
+    from skywalking import config
+
+    text = _configured_path(config.agent_ssl_trusted_ca_path)
+    if not text or ssl_file_path(text) is None:
+        return None
+    try:
+        path = Path(text).expanduser()
+        # absolute() does not follow symlinks (unlike resolve()).
+        return str(path.absolute())
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _ca_pem_has_trusted_certificate(root_certificates: bytes) -> bool:
+    """True when extracted CA bytes include an OpenSSL TRUSTED CERTIFICATE block."""
+    return b'BEGIN TRUSTED CERTIFICATE' in root_certificates
+
+
 def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
     """
     (verify, cert) for requests.Session.
@@ -634,13 +662,12 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
     (never the resolved symlink target), so Kubernetes secret rotation that
     removes the old ``..data`` version cannot invalidate an already-configured
     session. If the snapshot cannot be written (e.g. read-only temp dir), fall
-    back to the still-readable configured CA path rather than discarding the
-    private CA for Requests' default trust store.
+    back to the configured CA path **without resolving symlinks** (still
+    validated as readable) rather than discarding the private CA for Requests'
+    default trust store or pinning a deleted ``v1/`` target after rotation.
 
     Client-cert temp-file failures drop mTLS only (one-way TLS), with a warning.
     """
-    from skywalking import config
-
     material = tls_pem_material()
     if material is None:
         return True, None
@@ -650,15 +677,15 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
         try:
             verify: object = _ca_verify_temp_file(root_certificates)
         except OSError as exc:
-            ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
-            if ca_path is not None:
+            ca_verify = _configured_ca_path_for_verify()
+            if ca_verify is not None:
                 _warn_once(
                     f'requests-ca-temp:{exc}',
                     'Failed to persist trusted CA temp file (%s); '
                     'falling back to configured CA path for HTTP verify.',
                     exc,
                 )
-                verify = str(ca_path)
+                verify = ca_verify
             else:
                 _warn_once(
                     f'requests-ca-temp:{exc}',
@@ -707,9 +734,12 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
     - bad / unparsable custom CA without FORCE_TLS → plaintext (None)
     - bad client cert/key or temp-file failure → one-way TLS (CA or system trust)
 
-    Custom CA is loaded from normalized in-memory PEM bytes (``cadata``) when
-    present so path races and UTF-8 BOM/preamble cannot drop the custom trust
-    store after ``tls_pem_material`` already accepted the CA.
+    Custom CA is loaded from normalized in-memory PEM bytes (``cadata``) when the
+    bundle is plain ``CERTIFICATE`` only, so path races and UTF-8 BOM/preamble
+    cannot drop the custom trust store after ``tls_pem_material`` already accepted
+    the CA. Bundles that include ``TRUSTED CERTIFICATE`` (``openssl x509 -trustout``)
+    always use ``cafile``: Python's ``cadata`` loader can silently skip trusted
+    blocks while still succeeding on ordinary certificates in a mixed bundle.
     """
     from skywalking import config
 
@@ -722,32 +752,38 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
     def _system_trust_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
+    def _load_ca_via_cafile() -> Tuple[Optional[ssl.SSLContext], Optional[BaseException]]:
+        """Load custom CA through cafile (snapshot, else configured path)."""
+        try:
+            cafile = _ca_verify_temp_file(root_certificates)
+            return ssl.create_default_context(cafile=cafile), None
+        except OSError as temp_exc:
+            ca_verify = _configured_ca_path_for_verify()
+            if ca_verify is not None:
+                try:
+                    return ssl.create_default_context(cafile=ca_verify), None
+                except OSError as path_exc:
+                    return None, path_exc
+            return None, temp_exc
+
     ctx: Optional[ssl.SSLContext]
     if root_certificates is not None:
         load_exc: Optional[BaseException] = None
-        try:
-            # Normalized ASCII PEM from _load_trusted_ca (BOM/preamble stripped).
-            # Plain CERTIFICATE works via cadata; TRUSTED CERTIFICATE often needs cafile.
-            ctx = ssl.create_default_context(
-                cadata=root_certificates.decode('ascii'),
-            )
-        except (OSError, ValueError) as exc:
-            load_exc = exc
-            ctx = None
+        ctx = None
+        # TRUSTED CERTIFICATE must not go through cadata: mixed bundles can
+        # load only the ordinary CERTIFICATE entries and never raise.
+        if _ca_pem_has_trusted_certificate(root_certificates):
+            ctx, load_exc = _load_ca_via_cafile()
+        else:
             try:
-                cafile = _ca_verify_temp_file(root_certificates)
-                ctx = ssl.create_default_context(cafile=cafile)
-                load_exc = None
-            except OSError as temp_exc:
-                load_exc = temp_exc
-                ca_path = ssl_file_path(config.agent_ssl_trusted_ca_path)
-                if ca_path is not None:
-                    try:
-                        ctx = ssl.create_default_context(cafile=str(ca_path))
-                        load_exc = None
-                    except OSError as path_exc:
-                        load_exc = path_exc
-                        ctx = None
+                # Normalized ASCII PEM from _load_trusted_ca (BOM/preamble stripped).
+                ctx = ssl.create_default_context(
+                    cadata=root_certificates.decode('ascii'),
+                )
+            except (OSError, ValueError) as exc:
+                load_exc = exc
+                ctx = None
+                ctx, load_exc = _load_ca_via_cafile()
         if load_exc is not None:
             # ssl.SSLError subclasses OSError; ValueError: non-ASCII PEM bytes.
             if config.agent_force_tls:
