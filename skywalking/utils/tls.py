@@ -241,37 +241,12 @@ def normalize_private_key_pem(key_pem: bytes) -> bytes:
     return pem.encode('ascii')
 
 
-def _extract_pem_blocks(data: bytes, label: str) -> bytes:
-    """
-    Return ASCII PEM containing only ``BEGIN/END {label}`` blocks.
-
-    Strips UTF-8 BOM and ignores preamble/comments outside PEM delimiters so
-    OpenSSL-accepted files (BOM, UTF-8 comments) stay usable for ``cadata`` and
-    temp-file verify paths that require clean ASCII PEM.
-    """
-    text = data.decode('utf-8', errors='ignore').lstrip('\ufeff')
-    header = f'-----BEGIN {label}-----'
-    footer = f'-----END {label}-----'
-    blocks: List[str] = []
-    pos = 0
-    while True:
-        start = text.find(header, pos)
-        if start < 0:
-            break
-        end = text.find(footer, start)
-        if end < 0:
-            break
-        end += len(footer)
-        blocks.append(text[start:end].strip() + '\n')
-        pos = end
-    if not blocks:
-        raise ValueError(f'No {label} PEM block found')
-    return ''.join(blocks).encode('ascii')
-
-
 # OpenSSL ``openssl x509 -trustout`` emits TRUSTED CERTIFICATE (with trust
 # auxiliary). Keep that label — do not relabel as CERTIFICATE.
 _CA_PEM_LABELS = ('TRUSTED CERTIFICATE', 'CERTIFICATE')
+
+# Sentinel: optional ``material`` args mean "load via tls_pem_material()".
+_MATERIAL_UNSET = object()
 
 
 def _extract_ca_pem_blocks(data: bytes) -> bytes:
@@ -432,6 +407,20 @@ def _pem_bytes_to_temp_file(data: bytes, suffix: str) -> str:
     return path
 
 
+def _discard_mtls_temp_path(path: Optional[str]) -> None:
+    """Unlink a temp PEM and drop it from the process cleanup list."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    try:
+        _mtls_temp_files.remove(path)
+    except ValueError:
+        pass
+
+
 def _mtls_cert_key_files(
     certificate_chain: bytes,
     private_key: bytes,
@@ -440,6 +429,8 @@ def _mtls_cert_key_files(
     Write normalized PEM bytes to temp files (cached per material).
 
     Returns None when temp files cannot be created (caller stays one-way TLS).
+    If the key temp write fails after the cert was written, the orphaned cert
+    file is unlinked immediately (not left until process exit).
     """
     global _mtls_file_cache_key, _mtls_file_cache
 
@@ -447,12 +438,13 @@ def _mtls_cert_key_files(
     if _mtls_file_cache is not None and _mtls_file_cache_key == cache_key:
         return _mtls_file_cache
 
+    cert_path = None
     try:
-        paths = (
-            _pem_bytes_to_temp_file(certificate_chain, '.crt'),
-            _pem_bytes_to_temp_file(private_key, '.pem'),
-        )
+        cert_path = _pem_bytes_to_temp_file(certificate_chain, '.crt')
+        key_path = _pem_bytes_to_temp_file(private_key, '.pem')
+        paths = (cert_path, key_path)
     except OSError as exc:
+        _discard_mtls_temp_path(cert_path)
         _warn_once(
             f'mtls-temp:{exc}',
             'Failed to write mTLS cert/key temp files (%s); staying on one-way TLS.',
@@ -517,6 +509,27 @@ def tls_pem_material() -> Optional[Tuple[Optional[bytes], Optional[bytes], Optio
 
     certificate_chain, private_key = _mtls_material(ca_usable=ca_usable)
     return root_certificates, private_key, certificate_chain
+
+
+def safe_tls_pem_material() -> Optional[Tuple[Optional[bytes], Optional[bytes], Optional[bytes]]]:
+    """
+    ``tls_pem_material()`` that never raises into HTTP reporter ``__init__``.
+
+    On unexpected failure: FORCE_TLS → system-trust tuple; else plaintext None.
+    """
+    try:
+        return tls_pem_material()
+    except Exception as exc:  # noqa: BLE001 - never fail host process start
+        from skywalking import config
+
+        _warn_once(
+            f'tls-material:{exc}',
+            'Failed to load collector TLS material (%s); falling back.',
+            exc,
+        )
+        if config.agent_force_tls:
+            return None, None, None
+        return None
 
 
 def grpc_ssl_credentials():
@@ -585,15 +598,20 @@ def grpc_ssl_credentials():
         return None
 
 
-def collector_http_scheme() -> str:
+def collector_http_scheme(material=_MATERIAL_UNSET) -> str:
     """
     ``https://`` when TLS material is enabled, else ``http://``.
+
+    Pass ``material`` from a shared ``tls_pem_material()`` call so HTTP URL
+    scheme and session TLS settings cannot disagree across a TOCTOU window.
 
     Never raises into reporter ``__init__`` (HTTP clients call this before
     other TLS helpers that may wrap failures).
     """
     try:
-        return 'https://' if tls_pem_material() is not None else 'http://'
+        if material is _MATERIAL_UNSET:
+            material = tls_pem_material()
+        return 'https://' if material is not None else 'http://'
     except Exception as exc:  # noqa: BLE001 - never fail host process start
         from skywalking import config
 
@@ -648,12 +666,15 @@ def _ca_pem_has_trusted_certificate(root_certificates: bytes) -> bool:
     return b'BEGIN TRUSTED CERTIFICATE' in root_certificates
 
 
-def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
+def requests_tls_settings(material=_MATERIAL_UNSET) -> Tuple[object, Optional[Tuple[str, str]]]:
     """
     (verify, cert) for requests.Session.
 
     verify is True (system CAs), a CA file path, or unused for plaintext callers.
     cert is (cert_path, key_path) when mTLS files are present.
+
+    Pass ``material`` from a shared ``tls_pem_material()`` call (with
+    ``collector_http_scheme``) so scheme and verify cannot disagree.
 
     Keeps the same enable/disable decision as grpc_ssl_credentials / tls_pem_material
     so an unreadable or oversized CA cannot leave HTTP on https:// with a bad verify path.
@@ -668,7 +689,8 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
 
     Client-cert temp-file failures drop mTLS only (one-way TLS), with a warning.
     """
-    material = tls_pem_material()
+    if material is _MATERIAL_UNSET:
+        material = tls_pem_material()
     if material is None:
         return True, None
 
@@ -704,9 +726,9 @@ def requests_tls_settings() -> Tuple[object, Optional[Tuple[str, str]]]:
     return verify, pair
 
 
-def configure_requests_session(session) -> None:
+def configure_requests_session(session, material=_MATERIAL_UNSET) -> None:
     try:
-        verify, cert = requests_tls_settings()
+        verify, cert = requests_tls_settings(material)
     except Exception as exc:  # noqa: BLE001 - never fail host process start
         from skywalking import config
 
@@ -716,8 +738,9 @@ def configure_requests_session(session) -> None:
             exc,
         )
         if config.agent_force_tls or ssl_file_path(config.agent_ssl_trusted_ca_path):
-            # Prefer system-trust https over aborting agent start.
-            session.verify = True
+            # Prefer the configured private CA over discarding it for system trust.
+            ca_verify = _configured_ca_path_for_verify()
+            session.verify = ca_verify if ca_verify is not None else True
             session.cert = None
         return
     session.verify = verify
@@ -725,9 +748,12 @@ def configure_requests_session(session) -> None:
         session.cert = cert
 
 
-def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
+def ssl_context_for_collector(material=_MATERIAL_UNSET) -> Optional[ssl.SSLContext]:
     """
     stdlib SSLContext for aiohttp, or None when the collector stays plaintext.
+
+    Pass ``material`` from a shared ``tls_pem_material()`` call (with
+    ``collector_http_scheme``) so scheme and SSLContext cannot disagree.
 
     Degrade on SSLError / OSError (never raise into agent bootstrap):
     - bad / unparsable custom CA + FORCE_TLS → process trust store, no client cert
@@ -743,7 +769,8 @@ def ssl_context_for_collector() -> Optional[ssl.SSLContext]:
     """
     from skywalking import config
 
-    material = tls_pem_material()
+    if material is _MATERIAL_UNSET:
+        material = tls_pem_material()
     if material is None:
         return None
 

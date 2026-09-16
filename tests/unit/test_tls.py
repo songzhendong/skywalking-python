@@ -889,6 +889,61 @@ class TestCollectorTls(unittest.TestCase):
             self.assertTrue(os.path.exists(key_file), 'parent key temp deleted by child')
             self.assertEqual(tls_mod._mtls_file_cache, pair)
 
+    def test_mtls_partial_temp_failure_does_not_orphan_cert(self):
+        # Second mkstemp (key) fails after cert was written → cert must be unlinked.
+        calls = {'n': 0}
+        real_mkstemp = tempfile.mkstemp
+
+        def mkstemp_fail_on_key(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return real_mkstemp(*args, **kwargs)
+            raise OSError(30, 'Read-only file system')
+
+        with patch('tempfile.mkstemp', side_effect=mkstemp_fail_on_key), \
+                self.assertLogs('skywalking', level='WARNING') as logs:
+            pair = tls_mod._mtls_cert_key_files(_TEST_CLIENT_CERT, _TEST_CLIENT_KEY_PKCS1)
+        self.assertIsNone(pair)
+        self.assertEqual(tls_mod._mtls_temp_files, [])
+        self.assertTrue(any('temp files' in line for line in logs.output))
+
+    def test_configure_requests_session_fallback_prefers_configured_ca(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
+            config.agent_ssl_trusted_ca_path = str(ca)
+            session = MagicMock()
+            with patch('skywalking.utils.tls.requests_tls_settings', side_effect=RuntimeError('boom')), \
+                    self.assertLogs('skywalking', level='WARNING'):
+                tls_mod.configure_requests_session(session)
+            self.assertEqual(session.verify, str(Path(ca).expanduser().absolute()))
+            self.assertIsNone(session.cert)
+
+    def test_http_scheme_and_settings_share_one_material(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = self._write_pem(tmp, 'ca.crt', _TEST_CA_CERT)
+            config.agent_ssl_trusted_ca_path = str(ca)
+            material = tls_pem_material()
+            self.assertIsNotNone(material)
+
+            calls = {'n': 0}
+            real = tls_mod.tls_pem_material
+
+            def counting():
+                calls['n'] += 1
+                return real()
+
+            with patch.object(tls_mod, 'tls_pem_material', side_effect=counting):
+                # Shared material: helpers must not reload.
+                self.assertEqual(collector_http_scheme(material), 'https://')
+                verify, cert = requests_tls_settings(material)
+                self.assertIsInstance(verify, str)
+                self.assertIsNone(cert)
+                self.assertIsInstance(ssl_context_for_collector(material), ssl.SSLContext)
+            self.assertEqual(calls['n'], 0)
+
+    def test_extract_pem_blocks_removed(self):
+        self.assertFalse(hasattr(tls_mod, '_extract_pem_blocks'))
+
 
 if __name__ == '__main__':
     unittest.main()

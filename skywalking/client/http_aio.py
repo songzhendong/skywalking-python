@@ -21,11 +21,12 @@ from google.protobuf import json_format
 from skywalking import config
 from skywalking.client import ServiceManagementClientAsync, TraceSegmentReportServiceAsync, LogDataReportServiceAsync
 from skywalking.loggings import logger, logger_debug_enabled
-from skywalking.utils.tls import collector_http_scheme, ssl_context_for_collector
+from skywalking.utils import tls as tls_mod
+from skywalking.utils.tls import collector_http_scheme, safe_tls_pem_material, ssl_context_for_collector
 
 
-def _aiohttp_session():
-    ssl_ctx = ssl_context_for_collector()
+def _aiohttp_session(material=tls_mod._MATERIAL_UNSET):
+    ssl_ctx = ssl_context_for_collector(material)
     if ssl_ctx is None:
         return aiohttp.ClientSession()
     return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx))
@@ -36,11 +37,13 @@ class HttpServiceManagementClientAsync(ServiceManagementClientAsync):
         super().__init__()
         self.instance_properties = self.get_instance_properties()
 
-        proto = collector_http_scheme()
+        # One material load shared by scheme + SSLContext (avoid scheme/settings TOCTOU).
+        material = safe_tls_pem_material()
+        proto = collector_http_scheme(material)
         self.url_instance_props = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/management/reportProperties"
         self.url_heart_beat = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/management/keepAlive"
         # self.client = httpx.AsyncClient()
-        self.client = _aiohttp_session()
+        self.client = _aiohttp_session(material)
 
     async def send_instance_props(self):
 
@@ -73,10 +76,11 @@ class HttpServiceManagementClientAsync(ServiceManagementClientAsync):
 
 class HttpTraceSegmentReportServiceAsync(TraceSegmentReportServiceAsync):
     def __init__(self):
-        proto = collector_http_scheme()
+        material = safe_tls_pem_material()
+        proto = collector_http_scheme(material)
         self.url_report = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/segment"
         # self.client = httpx.AsyncClient()
-        self.client = _aiohttp_session()
+        self.client = _aiohttp_session(material)
 
     async def report(self, generator):
         async for segment in generator:
@@ -127,10 +131,11 @@ class HttpTraceSegmentReportServiceAsync(TraceSegmentReportServiceAsync):
 
 class HttpLogDataReportServiceAsync(LogDataReportServiceAsync):
     def __init__(self):
-        proto = collector_http_scheme()
+        material = safe_tls_pem_material()
+        proto = collector_http_scheme(material)
         self.url_report = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/logs"
         # self.client = httpx.AsyncClient()
-        self.client = _aiohttp_session()
+        self.client = _aiohttp_session(material)
 
     async def report(self, generator):
         log_batch = [json.loads(json_format.MessageToJson(log_data)) async for log_data in generator]
