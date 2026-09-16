@@ -22,7 +22,11 @@ from collections import deque
 from skywalking.protocol.common.Command_pb2 import Commands, Command
 
 from skywalking.command.base_command import BaseCommand
+from skywalking.command.configuration_discovery_command import ConfigurationDiscoveryCommand
 from skywalking.command.executors import noop_command_executor_instance
+from skywalking.command.executors.configuration_discovery_command_executor import (
+    ConfigurationDiscoveryCommandExecutor,
+)
 from skywalking.command.executors.profile_task_command_executor import ProfileTaskCommandExecutor
 from skywalking.command.profile_task_command import ProfileTaskCommand
 from skywalking.loggings import logger
@@ -128,7 +132,10 @@ class CommandExecutorService:
     """
 
     def __init__(self):
-        self.__command_executor_map = {ProfileTaskCommand.NAME: ProfileTaskCommandExecutor()}
+        self.__command_executor_map = {
+            ProfileTaskCommand.NAME: ProfileTaskCommandExecutor(),
+            ConfigurationDiscoveryCommand.NAME: ConfigurationDiscoveryCommandExecutor(),
+        }
 
     def execute(self, command: BaseCommand):
         self.__executor_for_command(command).execute(command)
@@ -148,8 +155,9 @@ class CommandDeserializer:
 
         if ProfileTaskCommand.NAME == command_name:
             return ProfileTaskCommand.deserialize(command)
-        else:
-            raise UnsupportedCommandException(command)
+        if ConfigurationDiscoveryCommand.NAME == command_name:
+            return ConfigurationDiscoveryCommand.deserialize(command)
+        raise UnsupportedCommandException(command)
 
 
 class UnsupportedCommandException(Exception):

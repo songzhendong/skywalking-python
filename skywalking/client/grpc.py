@@ -19,9 +19,10 @@ import grpc
 
 from skywalking import config
 from skywalking.client import ServiceManagementClient, TraceSegmentReportService, ProfileTaskChannelService, \
-    LogDataReportService, MeterReportService
+    LogDataReportService, MeterReportService, ConfigurationDiscoveryChannelService
 from skywalking.utils.grpc_channel import grpc_call_timeout
 from skywalking.command import command_service
+from skywalking.conf.dynamic import configuration_discovery_service
 from skywalking.loggings import logger, logger_debug_enabled
 from skywalking.profile import profile_task_execution_service
 from skywalking.profile.profile_task import ProfileTask
@@ -29,6 +30,10 @@ from skywalking.protocol.language_agent.Tracing_pb2_grpc import TraceSegmentRepo
 from skywalking.protocol.logging.Logging_pb2_grpc import LogReportServiceStub
 from skywalking.protocol.management.Management_pb2 import InstancePingPkg, InstanceProperties
 from skywalking.protocol.language_agent.Meter_pb2_grpc import MeterReportServiceStub
+from skywalking.protocol.language_agent.ConfigurationDiscoveryService_pb2 import ConfigurationSyncRequest
+from skywalking.protocol.language_agent.ConfigurationDiscoveryService_pb2_grpc import (
+    ConfigurationDiscoveryServiceStub,
+)
 from skywalking.protocol.management.Management_pb2_grpc import ManagementServiceStub
 from skywalking.protocol.profile.Profile_pb2 import ProfileTaskCommandQuery, ProfileTaskFinishReport
 from skywalking.protocol.profile.Profile_pb2_grpc import ProfileTaskStub
@@ -124,3 +129,32 @@ class GrpcProfileTaskChannelService(ProfileTaskChannelService):
             taskId=task.task_id
         )
         self.profile_stub.reportTaskFinish(finish_report, timeout=grpc_call_timeout())
+
+
+class GrpcConfigurationDiscoveryChannelService(ConfigurationDiscoveryChannelService):
+    def __init__(self, channel: grpc.Channel):
+        self._stub = ConfigurationDiscoveryServiceStub(channel)
+        self._cds_unimplemented = False
+
+    def sync(self):
+        if self._cds_unimplemented:
+            return
+        request = ConfigurationSyncRequest(service=config.agent_name)
+        uuid = configuration_discovery_service.peek_uuid()
+        if uuid:
+            request.uuid = uuid
+        try:
+            commands = self._stub.fetchConfigurations(request, timeout=grpc_call_timeout())
+        except grpc.RpcError as exc:
+            code = exc.code() if callable(getattr(exc, 'code', None)) else None
+            # OAP may disable CDS; avoid error spam (Java agent had the same issue).
+            if code == grpc.StatusCode.UNIMPLEMENTED:
+                if not self._cds_unimplemented:
+                    self._cds_unimplemented = True
+                    logger.warning(
+                        'OAP does not implement ConfigurationDiscoveryService; '
+                        'dynamic agent config (CDS) is disabled for this process.'
+                    )
+                return
+            raise
+        command_service.receive_command(commands)

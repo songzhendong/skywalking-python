@@ -35,6 +35,7 @@ def init(force: bool = False):
 
     logger.debug('Initializing sampling service')
     sampling_service = SamplingService()
+    sampling_service.register_cds_watcher()
     sampling_service.start()
 
 
@@ -44,6 +45,7 @@ async def init_async(async_event: Optional[asyncio.Event] = None):
     global sampling_service
 
     sampling_service = SamplingServiceAsync()
+    sampling_service.register_cds_watcher()
     if async_event is not None:
         async_event.set()
     task = asyncio.create_task(sampling_service.start())

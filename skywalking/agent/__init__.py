@@ -492,6 +492,16 @@ class SkyWalkingAgent(Singleton):
                                            daemon=True)
             __send_profile_thread.start()
 
+        # CDS is gRPC-only; command dispatch is shared with profiling when both are on.
+        if config.agent_protocol == 'grpc':
+            if not config.agent_profile_active:
+                __command_dispatch_thread = Thread(name='CommandDispatchThread', target=self.__command_dispatch,
+                                                   daemon=True)
+                __command_dispatch_thread.start()
+            __cds_thread = Thread(name='ConfigurationDiscoveryThread',
+                                  target=self.__sync_agent_configurations, daemon=True)
+            __cds_thread.start()
+
     @staticmethod  # for now
     def __fork_before() -> None:
         """
@@ -593,7 +603,10 @@ class SkyWalkingAgent(Singleton):
             profile.init()
         if config.agent_meter_reporter_active:
             meter.init(force=True)  # force re-init after fork()
-        if config.sample_n_per_3_secs > 0:
+        # Always start sampling for gRPC so CDS can enable rate limiting at runtime
+        # (Java SamplingService + SamplingRateWatcher). Other protocols keep
+        # bootstrap-only: init only when sample_n_per_3_secs > 0.
+        if config.agent_protocol == 'grpc' or config.sample_n_per_3_secs > 0:
             sampling.init(force=True)
 
         self.__bootstrap()  # calls init_threading
@@ -771,6 +784,11 @@ class SkyWalkingAgent(Singleton):
     def __query_profile_command(self) -> None:
         self.__protocol.query_profile_commands()
 
+    @report_with_backoff(reporter_name='sync_agent_configurations',
+                         init_wait=config.agent_collector_get_agent_dynamic_config_interval)
+    def __sync_agent_configurations(self) -> None:
+        self.__protocol.sync_agent_configurations()
+
     @staticmethod
     def __command_dispatch() -> None:
         # command dispatch will stuck when there are no commands
@@ -904,6 +922,11 @@ class SkyWalkingAgentAsync(Singleton):
             self.background_coroutines.add(self.__query_profile_command())
             self.background_coroutines.add(self.__send_profile_snapshot())
 
+        if config.agent_protocol == 'grpc':
+            if not config.agent_profile_active:
+                self.background_coroutines.add(self.__command_dispatch())
+            self.background_coroutines.add(self.__sync_agent_configurations())
+
     async def __start_event_loop_async(self) -> None:
         self.loop = asyncio.get_running_loop()  # always get the current running loop first
         # asyncio Queue should be created after the creation of event loop
@@ -926,7 +949,7 @@ class SkyWalkingAgentAsync(Singleton):
         if config.agent_meter_reporter_active:
             # meter.init(force=True)
             await meter.init_async()
-        if config.sample_n_per_3_secs > 0:
+        if config.agent_protocol == 'grpc' or config.sample_n_per_3_secs > 0:
             await sampling.init_async()
 
         await self.__bootstrap()  # gather all coroutines
@@ -1092,6 +1115,12 @@ class SkyWalkingAgentAsync(Singleton):
         init_wait=config.agent_collector_get_profile_task_interval)
     async def __query_profile_command(self) -> None:
         await self.__protocol.query_profile_commands()
+
+    @report_with_backoff_async(
+        reporter_name='sync_agent_configurations',
+        init_wait=config.agent_collector_get_agent_dynamic_config_interval)
+    async def __sync_agent_configurations(self) -> None:
+        await self.__protocol.sync_agent_configurations()
 
     @staticmethod
     async def __command_dispatch() -> None:
