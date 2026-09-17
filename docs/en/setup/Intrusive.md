@@ -42,7 +42,7 @@ agent.start()
 Implementation notes (maintainers / operators):
 
 - Mixed IPv4/IPv6 stays in one list; IPv4 is encoded as IPv4-mapped IPv6 for grpcio so `pick_first` can try both families.
-- Multi-hostname lists are DNS-expanded once at channel build (about 5s lookup budget per name); there is no periodic re-resolve — prefer a single address or stable IPs when DNS changes.
+- Multi-hostname lists are DNS-expanded at channel build (about 5s lookup budget per name). With `agent_collector_is_resolve_dns_periodically=true` (env `SW_AGENT_COLLECTOR_IS_RESOLVE_DNS_PERIODICALLY`), hostnames — including a single hostname — are expanded to static IPs and re-checked every `agent_collector_grpc_channel_check_interval` seconds (default 30, Java `collector.grpc_channel_check_interval`). Unlike Java's reconnect-gated resolve, Python checks every interval while connected so Headless/Service IP churn is picked up without waiting for an RPC failure. Any change to the expanded IP set (grow or shrink) rebuilds the whole pick_first channel (Python does not use Java's single-index reconnect manager). A transient failure of any configured hostname keeps the previous dial plan instead of shrinking the static set.
 - Channel `:authority` uses `grpc.default_authority` = the first configured endpoint (before shuffle). With that arg set, gRPC C-core also uses it for TLS peer-name / SNI checks (host only after `SplitHostPort`; port is never checked) — not the encoded multi-address channel target used for dialing. Prefer a first endpoint whose CN/SAN matches the server cert; multi-backend IP expansion still needs certs that cover those dial targets if you rely on target-derived names without `default_authority`.
 
 #### gRPC / HTTP TLS and mTLS

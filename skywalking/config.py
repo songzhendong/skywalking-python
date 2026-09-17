@@ -109,6 +109,22 @@ agent_logging_level: str = os.getenv('SW_AGENT_LOGGING_LEVEL', 'INFO')
 # BEGIN: Agent Core Danger Zone
 # The agent will exchange heartbeat message with SkyWalking OAP backend every `period` seconds
 agent_collector_heartbeat_period: int = int(os.getenv('SW_AGENT_COLLECTOR_HEARTBEAT_PERIOD', '30'))
+# When true, periodically re-resolve DNS for collector hostnames and rebuild the gRPC
+# channel if the expanded address set changes (Java collector.is_resolve_dns_periodically).
+# Default false. Unlike Java's reconnect-gated resolve, Python checks every interval while
+# connected so Headless/Service IP churn is picked up without waiting for an RPC failure.
+# Cadence: agent_collector_grpc_channel_check_interval. gRPC protocol only.
+# Any change to the expanded IP set (grow or shrink) rebuilds the whole pick_first
+# channel; a transient failure of any configured hostname keeps the previous plan.
+agent_collector_is_resolve_dns_periodically: bool = os.getenv(
+    'SW_AGENT_COLLECTOR_IS_RESOLVE_DNS_PERIODICALLY', ''
+).lower() == 'true'
+# Seconds between periodic DNS re-resolve checks when
+# agent_collector_is_resolve_dns_periodically is true (Java collector.grpc_channel_check_interval).
+# Python does not use this for Java-style channel health polling - pick_first owns failover.
+agent_collector_grpc_channel_check_interval: int = int(
+    os.getenv('SW_AGENT_COLLECTOR_GRPC_CHANNEL_CHECK_INTERVAL', '30')
+)
 # The agent will report service instance properties every
 # `factor * heartbeat period` seconds default: 10*30 = 300 seconds (Java/Node cadence).
 # Also covers gRPC pick_first silent backend switches that stay READY without a disconnect event.

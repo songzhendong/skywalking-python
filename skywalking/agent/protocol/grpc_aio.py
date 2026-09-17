@@ -18,6 +18,7 @@
 import logging
 import traceback
 import asyncio
+import contextlib
 from asyncio import Queue, Event
 
 import grpc
@@ -34,6 +35,8 @@ from skywalking.utils.grpc_channel import (
     create_aio_channel,
     handle_rpc_error,
     is_channel_ready,
+    log_dns_reresolve_failure_throttled,
+    resolve_collector_dial_plan,
 )
 from skywalking.profile.profile_task import ProfileTask
 from skywalking.profile.snapshot import TracingThreadSnapshot
@@ -52,59 +55,235 @@ class GrpcProtocolAsync(ProtocolAsync):
     def __init__(self):
         self.properties_sent = Event()
         self.state = None
+        self._dns_fingerprint = None
+        self._dial_plan = None
+        self._auth_interceptors = None
+        self._channel_generation = 0
+        self._closed = False
+        # Wakes watch_connectivity when the channel is replaced even if old.close() fails.
+        self._channel_changed = asyncio.Event()
 
         # grpc.aio has no Channel.subscribe(); watch_connectivity() mirrors Node
         # watchConnectivityState via wait_for_state_change (started by the agent loop).
 
-        interceptors = None
         if config.agent_authentication:
-            interceptors = [header_adder_interceptor_async('authentication', config.agent_authentication)]
+            self._auth_interceptors = [
+                header_adder_interceptor_async('authentication', config.agent_authentication)
+            ]
 
         # One channel for process lifetime; multi-address failover via gRPC pick_first.
-        self.channel = create_aio_channel(interceptors=interceptors)
+        target, authority, fingerprint = resolve_collector_dial_plan()
+        self._bind_channel(target, authority, fingerprint=fingerprint)
 
-        self.service_management = GrpcServiceManagementClientAsync(self.channel)
-        self.traces_reporter = GrpcTraceSegmentReportServiceAsync(self.channel)
-        self.log_reporter = GrpcLogReportServiceAsync(self.channel)
-        self.meter_reporter = GrpcMeterReportServiceAsync(self.channel)
-        self.profile_channel = GrpcProfileTaskChannelServiceAsync(self.channel)
+    def _notify_channel_changed(self):
+        try:
+            self._channel_changed.set()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _abandon_aio_channel(self, channel) -> None:
+        """Best-effort close for a channel that never became self.channel."""
+        try:
+            result = channel.close()
+            if not asyncio.iscoroutine(result):
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # Off the agent loop (failed construct during unusual init):
+                # drain close so the channel is not leaked by dropping the coroutine.
+                try:
+                    asyncio.run(result)
+                except Exception:  # noqa: BLE001
+                    with contextlib.suppress(Exception):
+                        result.close()
+                return
+            loop.create_task(result)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _bind_channel(self, target: str, authority: str, fingerprint=None):
+        # Construct channel + clients fully before swapping self.* so a
+        # constructor failure does not orphan the previous live channel or
+        # invalidate watch_connectivity's generation for it.
+        channel = create_aio_channel(
+            interceptors=self._auth_interceptors,
+            target=target,
+            authority=authority,
+        )
+        try:
+            service_management = GrpcServiceManagementClientAsync(channel)
+            traces_reporter = GrpcTraceSegmentReportServiceAsync(channel)
+            log_reporter = GrpcLogReportServiceAsync(channel)
+            meter_reporter = GrpcMeterReportServiceAsync(channel)
+            profile_channel = GrpcProfileTaskChannelServiceAsync(channel)
+        except Exception:
+            self._abandon_aio_channel(channel)
+            raise
+
+        self._channel_generation += 1
+        self.channel = channel
+        self.service_management = service_management
+        self.traces_reporter = traces_reporter
+        self.log_reporter = log_reporter
+        self.meter_reporter = meter_reporter
+        self.profile_channel = profile_channel
+        self._dns_fingerprint = fingerprint
+        self._dial_plan = (target, authority, fingerprint)
+        self.state = None
+        self._notify_channel_changed()
+
+    async def maybe_reresolve_dns(self) -> bool:
+        """
+        Rebuild the aio channel when periodic DNS sees a dial-plan change.
+
+        DNS runs in ``asyncio.to_thread``. Bind is refused when ``_closed``;
+        a successful bind closes the previous channel (best-effort). Cancel
+        during ``old.close()`` still attempts to tear down the displaced channel.
+        """
+        if not config.agent_collector_is_resolve_dns_periodically:
+            return False
+        if self._closed:
+            return False
+        previous = self._dial_plan
+        old = None
+        # Offload blocking getaddrinfo waits so the agent asyncio loop stays responsive
+        # (heartbeat / report / connectivity watch). Cancel does not interrupt the
+        # worker thread, but we refuse to bind after cancel/close.
+        try:
+            target, authority, fingerprint = await asyncio.to_thread(
+                resolve_collector_dial_plan, previous=previous,
+            )
+            if self._closed:
+                return False
+            if fingerprint == self._dns_fingerprint:
+                return False
+            logger.info(
+                'Collector DNS dial plan changed (%s -> %s); rebuilding aio gRPC channel',
+                self._dns_fingerprint,
+                fingerprint,
+            )
+            # Re-check after logging: cross-thread begin_shutdown()/close() may have
+            # flipped _closed (same-loop shutdown cancels at the next await).
+            if self._closed:
+                return False
+            old = self.channel
+            self._bind_channel(target, authority, fingerprint=fingerprint)
+            self.properties_sent.clear()
+            self.service_management.sent_properties_counter = 0
+            try:
+                # Unblocks watch_connectivity wait_for_state_change on the old channel.
+                # _notify_channel_changed already ran in _bind_channel as a fallback if
+                # close fails or never wakes the waiter.
+                await old.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        except asyncio.CancelledError:
+            # If cancel hit during await old.close(), the new channel is already
+            # bound; still try to tear down the previous channel.
+            if old is not None and old is not self.channel:
+                try:
+                    await old.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+
+    async def watch_dns_reresolve(self):
+        """Background loop: Java grpc_channel_check_interval cadence, pick_first rebuild."""
+        if not config.agent_collector_is_resolve_dns_periodically:
+            return
+        interval = max(1, int(config.agent_collector_grpc_channel_check_interval))
+        logger.info(
+            'Periodic collector DNS re-resolve enabled for aio (interval=%ss)',
+            interval,
+        )
+        while not self._closed:
+            try:
+                await asyncio.sleep(interval)
+                if self._closed:
+                    return
+                await self.maybe_reresolve_dns()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log_dns_reresolve_failure_throttled('Periodic aio collector DNS re-resolve failed')
 
     def is_ready(self) -> bool:
-        """Prefer watch-maintained state; peek+nudge when IDLE/None before watch catches up."""
+        """
+        Prefer watch-maintained state as source of truth.
+
+        When state is None or IDLE, peek+nudge via get_state(True) and apply the
+        result under the channel generation captured for this peek so a concurrent
+        DNS rebuild cannot publish a stale connectivity state.
+        """
         if self.state == grpc.ChannelConnectivity.READY:
             return True
         if self.state in (None, grpc.ChannelConnectivity.IDLE):
+            generation = self._channel_generation
+            channel = self.channel
             try:
-                peeked = self.channel.get_state(True)
+                peeked = channel.get_state(True)
                 if peeked is not None:
-                    self._on_connectivity(peeked)
+                    self._on_connectivity(peeked, generation=generation)
             except Exception:  # noqa: BLE001
-                is_channel_ready(self.channel)
+                is_channel_ready(channel)
         return self.state == grpc.ChannelConnectivity.READY
 
-    def _on_connectivity(self, state) -> None:
+    def _on_connectivity(self, state, generation=None) -> None:
+        if generation is not None and generation != self._channel_generation:
+            return
         prev = self.state
+        service_management = self.service_management
         if logger_debug_enabled:
             logger.debug('grpc aio channel connectivity changed, [%s -> %s]', prev, state)
         apply_connectivity_transition(prev, state)
         if prev == grpc.ChannelConnectivity.READY and state != grpc.ChannelConnectivity.READY:
+            if generation is not None and generation != self._channel_generation:
+                return
             self.properties_sent.clear()
-            self.service_management.sent_properties_counter = 0
+            service_management.sent_properties_counter = 0
+        if generation is not None and generation != self._channel_generation:
+            return
         self.state = state
 
     async def watch_connectivity(self):
         """
         Background watch: aio equivalent of sync Channel.subscribe.
         get_state(True) nudges IDLE; wait_for_state_change blocks until transition.
+        Rebinds to self.channel after DNS rebuild (generation + Event wake; old.close
+        is best-effort and must not be the only wake path).
         """
-        while True:
+        while not self._closed:
+            generation = self._channel_generation
+            channel = self.channel
             try:
-                state = self.channel.get_state(try_to_connect=True)
-                self._on_connectivity(state)
-                await self.channel.wait_for_state_change(state)
+                state = channel.get_state(try_to_connect=True)
+                if generation != self._channel_generation or self._closed:
+                    continue
+                self._on_connectivity(state, generation=generation)
+                self._channel_changed.clear()
+                # Rebuild may have raced between clear() and wait().
+                if generation != self._channel_generation or self._closed:
+                    continue
+                wait_state = asyncio.create_task(channel.wait_for_state_change(state))
+                wait_wake = asyncio.create_task(self._channel_changed.wait())
+                done, pending = await asyncio.wait(
+                    {wait_state, wait_wake},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                for task in done:
+                    with contextlib.suppress(Exception):
+                        task.result()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - keep watch alive across transient errors
+                if generation != self._channel_generation or self._closed:
+                    continue
                 if logger_debug_enabled:
                     logger.debug('aio connectivity watch error', exc_info=True)
                 await asyncio.sleep(1.0)
@@ -143,8 +322,24 @@ class GrpcProtocolAsync(ProtocolAsync):
         # DEADLINE_EXCEEDED on READY is not a connectivity failure; see handle_rpc_error.
         traceback.print_exc() if logger.isEnabledFor(logging.DEBUG) else None
 
+    def begin_shutdown(self) -> None:
+        """
+        Mark closed and wake watches before canceling background tasks.
+
+        Call this from agent shutdown *before* cancelling watch_dns /
+        watch_connectivity so in-flight to_thread DNS work refuses to bind,
+        even if CancelledError is slow to deliver.
+        """
+        if self._closed:
+            self._notify_channel_changed()
+            return
+        self._closed = True
+        self._channel_generation += 1
+        self._notify_channel_changed()
+
     def close(self):
         """Best-effort channel teardown on agent stop (Node shutdownNow parity)."""
+        self.begin_shutdown()
         # grpc.aio.Channel.close is async; schedule on the running loop when possible.
         try:
             result = self.channel.close()
@@ -161,6 +356,7 @@ class GrpcProtocolAsync(ProtocolAsync):
 
     async def aclose(self):
         """Await channel close from the agent event loop."""
+        self.begin_shutdown()
         try:
             await self.channel.close()
         except Exception:  # noqa: BLE001

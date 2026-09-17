@@ -18,7 +18,9 @@
 import logging
 import traceback
 from queue import Queue, Empty
+from threading import Event, Thread, Lock
 from time import monotonic
+from typing import Optional
 
 import grpc
 
@@ -31,8 +33,11 @@ from skywalking.loggings import logger, logger_debug_enabled
 from skywalking.utils.grpc_channel import (
     apply_connectivity_transition,
     create_sync_channel,
+    dns_reresolve_join_timeout_sec,
     handle_rpc_error,
     is_channel_ready,
+    log_dns_reresolve_failure_throttled,
+    resolve_collector_dial_plan,
 )
 from skywalking.utils.reporter_log import log_dropped_throttled
 from skywalking.profile.profile_task import ProfileTask
@@ -72,23 +77,245 @@ class GrpcProtocol(Protocol):
     def __init__(self):
         self.properties_sent = False
         self.state = None
+        self._dns_fingerprint = None
+        self._dial_plan = None  # type: Optional[tuple]
+        self._dns_stop = Event()
+        self._dns_thread = None
+        self._channel_generation = 0
+        self._active_cb = None
+        self._channel_lock = Lock()
 
         # One channel for process lifetime; multi-address failover via gRPC pick_first.
-        self.channel = create_sync_channel()
+        # Periodic DNS (when enabled) may rebuild this channel if the IP set changes.
+        target, authority, fingerprint = resolve_collector_dial_plan()
+        self._bind_channel(target, authority, fingerprint=fingerprint)
+        self._start_dns_reresolve_thread()
 
-        if config.agent_authentication:
-            self.channel = grpc.intercept_channel(
-                self.channel, header_adder_interceptor('authentication', config.agent_authentication)
-            )
+    def _make_connectivity_cb(self, generation):
+        def _cb(state, _generation=generation):
+            # Ignore connectivity events from a channel we already replaced.
+            if _generation != self._channel_generation:
+                return
+            # Snapshot before mutating: a concurrent rebuild may bump generation
+            # and swap service_management under us (narrow TOCTOU window).
+            prev = self.state
+            service_management_ref = self.service_management
+            if logger_debug_enabled:
+                logger.debug('grpc channel connectivity changed, [%s -> %s]', prev, state)
+            try:
+                apply_connectivity_transition(prev, state)
+                if prev == grpc.ChannelConnectivity.READY and state != grpc.ChannelConnectivity.READY:
+                    if _generation != self._channel_generation:
+                        return
+                    self.properties_sent = False
+                    service_management_ref.sent_properties_counter = 0
+            except Exception:  # noqa: BLE001 - never let grpc's connectivity thread die on us
+                logger.exception('failed to handle grpc connectivity transition')
+            if _generation != self._channel_generation:
+                return
+            self.state = state
 
-        self.service_management = GrpcServiceManagementClient(self.channel)
-        self.traces_reporter = GrpcTraceSegmentReportService(self.channel)
-        self.profile_channel = GrpcProfileTaskChannelService(self.channel)
-        self.log_reporter = GrpcLogDataReportService(self.channel)
-        self.meter_reporter = GrpcMeterReportService(self.channel)
+        return _cb
+
+    def _resubscribe_channel(self, channel, prefer_cb=None) -> None:
+        """
+        Attach a connectivity subscribe callback to ``channel``.
+
+        Tries ``prefer_cb`` first (rollback path). If that fails, mints a fresh
+        generation-scoped callback so reporting is not left without a watch.
+        """
+        if prefer_cb is not None:
+            try:
+                channel.subscribe(prefer_cb, try_to_connect=True)
+                self._active_cb = prefer_cb
+                return
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    'Failed to restore previous gRPC subscribe callback; '
+                    'retrying with a fresh callback',
+                    exc_info=logger_debug_enabled,
+                )
+        self._channel_generation += 1
+        generation = self._channel_generation
+        cb = self._make_connectivity_cb(generation)
+        self._active_cb = cb
+        self.state = None
+        channel.subscribe(cb, try_to_connect=True)
+
+    def _bind_channel(self, target: str, authority: str, fingerprint=None):
+        # Build the new channel + clients fully before swapping self.* so a
+        # constructor failure never leaves a half-bound protocol or invalidates
+        # the still-live previous subscribe generation.
+        channel = create_sync_channel(target=target, authority=authority)
+        try:
+            if config.agent_authentication:
+                channel = grpc.intercept_channel(
+                    channel, header_adder_interceptor('authentication', config.agent_authentication)
+                )
+            service_management = GrpcServiceManagementClient(channel)
+            traces_reporter = GrpcTraceSegmentReportService(channel)
+            profile_channel = GrpcProfileTaskChannelService(channel)
+            log_reporter = GrpcLogDataReportService(channel)
+            meter_reporter = GrpcMeterReportService(channel)
+        except Exception:
+            try:
+                channel.close()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._channel_generation += 1
+        generation = self._channel_generation
+        _cb = self._make_connectivity_cb(generation)
+
+        self.channel = channel
+        self.service_management = service_management
+        self.traces_reporter = traces_reporter
+        self.profile_channel = profile_channel
+        self.log_reporter = log_reporter
+        self.meter_reporter = meter_reporter
+        self._dns_fingerprint = fingerprint
+        self._dial_plan = (target, authority, fingerprint)
+        self.state = None
+        self._active_cb = _cb
 
         # Subscribe last: _cb runs on a grpc thread and touches service_management.
-        self.channel.subscribe(self._cb, try_to_connect=True)
+        self.channel.subscribe(self._active_cb, try_to_connect=True)
+
+    def _start_dns_reresolve_thread(self):
+        if not config.agent_collector_is_resolve_dns_periodically:
+            return
+        interval = max(1, int(config.agent_collector_grpc_channel_check_interval))
+        self._dns_thread = Thread(
+            name='GrpcDnsReResolve',
+            target=self._dns_reresolve_loop,
+            args=(interval,),
+            daemon=True,
+        )
+        self._dns_thread.start()
+        logger.info(
+            'Periodic collector DNS re-resolve enabled (interval=%ss)',
+            interval,
+        )
+
+    def _dns_reresolve_loop(self, interval: int):
+        while not self._dns_stop.wait(interval):
+            try:
+                self.maybe_reresolve_dns()
+            except Exception:  # noqa: BLE001 - never kill the watcher thread
+                log_dns_reresolve_failure_throttled('Periodic collector DNS re-resolve failed')
+
+    def maybe_reresolve_dns(self) -> bool:
+        """
+        Re-resolve collector DNS. Rebuild the pick_first channel when the dial
+        plan fingerprint changes. Returns True if a rebuild happened.
+
+        Resolve runs outside ``_channel_lock``. On bind/subscribe failure the
+        previous channel, clients, and fingerprint are restored and connectivity
+        is re-subscribed (fresh callback if the prior one cannot be reattached).
+        The displaced channel is closed outside the lock.
+        """
+        if not config.agent_collector_is_resolve_dns_periodically:
+            return False
+        if self._dns_stop.is_set():
+            return False
+        # Resolve outside the channel lock so close()/on_error are not blocked
+        # for the full DNS budget (up to ~5s per hostname).
+        with self._channel_lock:
+            if self._dns_stop.is_set():
+                return False
+            previous = self._dial_plan
+        target, authority, fingerprint = resolve_collector_dial_plan(
+            previous=previous,
+        )
+        old_to_close = None
+        rebuilt = False
+        try:
+            with self._channel_lock:
+                if self._dns_stop.is_set():
+                    return False
+                if fingerprint == self._dns_fingerprint:
+                    return False
+                logger.info(
+                    'Collector DNS dial plan changed (%s -> %s); rebuilding gRPC channel',
+                    self._dns_fingerprint,
+                    fingerprint,
+                )
+                old = self.channel
+                old_cb = self._active_cb
+                # Snapshot so a post-commit failure (e.g. subscribe) can restore.
+                prev_sm = self.service_management
+                prev_traces = self.traces_reporter
+                prev_profile = self.profile_channel
+                prev_log = self.log_reporter
+                prev_meter = self.meter_reporter
+                prev_fp = self._dns_fingerprint
+                prev_plan = self._dial_plan
+                prev_state = self.state
+                prev_props = self.properties_sent
+                prev_gen = self._channel_generation
+                try:
+                    if old_cb is not None:
+                        old.unsubscribe(old_cb)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    self._bind_channel(target, authority, fingerprint=fingerprint)
+                    self.properties_sent = False
+                    self.service_management.sent_properties_counter = 0
+                    old_to_close = old
+                    rebuilt = True
+                except Exception:
+                    if self.channel is old:
+                        # Create never swapped self.channel; re-subscribe previous.
+                        if not self._dns_stop.is_set():
+                            try:
+                                self._resubscribe_channel(old, prefer_cb=old_cb)
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    'Failed to resubscribe gRPC channel after DNS bind failure'
+                                )
+                    else:
+                        # Swapped then failed (typically subscribe): restore prior
+                        # channel/clients/fingerprint so DNS can retry later and
+                        # reporting is not stuck on an unsubscribed channel.
+                        broken = self.channel
+                        broken_cb = self._active_cb
+                        try:
+                            if broken_cb is not None:
+                                broken.unsubscribe(broken_cb)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self.channel = old
+                        self._active_cb = old_cb
+                        self.service_management = prev_sm
+                        self.traces_reporter = prev_traces
+                        self.profile_channel = prev_profile
+                        self.log_reporter = prev_log
+                        self.meter_reporter = prev_meter
+                        self._dns_fingerprint = prev_fp
+                        self._dial_plan = prev_plan
+                        self.state = prev_state
+                        self.properties_sent = prev_props
+                        self._channel_generation = prev_gen
+                        if not self._dns_stop.is_set():
+                            try:
+                                self._resubscribe_channel(old, prefer_cb=old_cb)
+                            except Exception:  # noqa: BLE001
+                                logger.exception(
+                                    'Failed to resubscribe gRPC channel after DNS rebuild rollback'
+                                )
+                        old_to_close = broken
+                    raise
+        finally:
+            # Close outside the lock so a stuck C-core close cannot block
+            # on_error()/agent close() from taking the lock.
+            if old_to_close is not None:
+                try:
+                    old_to_close.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        return rebuilt
 
     def is_ready(self) -> bool:
         """
@@ -97,29 +324,15 @@ class GrpcProtocol(Protocol):
         Sync grpcio has no Channel.get_state(); check_connectivity_state can disagree
         with subscribe callbacks on some builds and permanently skipped all RPCs in
         E2E (channel already READY via subscribe, reporters still gated). Use the
-        watched state as source of truth; only nudge C-core when IDLE.
+        watched state as source of truth; nudge C-core when state is None or IDLE
+        (including the post-rollback window before the first subscribe callback).
         """
         if self.state == grpc.ChannelConnectivity.READY:
             return True
-        if self.state == grpc.ChannelConnectivity.IDLE:
+        if self.state in (None, grpc.ChannelConnectivity.IDLE):
             # Side-effect nudge (ignore return); subscribe callback updates self.state.
             is_channel_ready(self.channel)
         return self.state == grpc.ChannelConnectivity.READY
-
-    def _cb(self, state):
-        prev = self.state
-        if logger_debug_enabled:
-            logger.debug('grpc channel connectivity changed, [%s -> %s]', prev, state)
-        try:
-            apply_connectivity_transition(prev, state)
-            # Independent OAPs need properties re-registered after failover.
-            # Immediate send via properties_sent; periodic refresh covers silent READY switches.
-            if prev == grpc.ChannelConnectivity.READY and state != grpc.ChannelConnectivity.READY:
-                self.properties_sent = False
-                self.service_management.sent_properties_counter = 0
-        except Exception:  # noqa: BLE001 - never let grpc's connectivity thread die on us
-            logger.exception('failed to handle grpc connectivity transition')
-        self.state = state
 
     def query_profile_commands(self):
         if not self.is_ready():
@@ -152,19 +365,52 @@ class GrpcProtocol(Protocol):
         # Re-subscribe the same channel only — never rebuild or rotate backends here.
         # DEADLINE_EXCEEDED on READY is not a connectivity failure; see handle_rpc_error.
         traceback.print_exc() if logger.isEnabledFor(logging.DEBUG) else None
-        self.channel.unsubscribe(self._cb)
-        self.channel.subscribe(self._cb, try_to_connect=True)
+        with self._channel_lock:
+            if self._dns_stop.is_set():
+                return
+            cb = self._active_cb
+            channel = self.channel
+            if cb is None:
+                return
+            try:
+                channel.unsubscribe(cb)
+            except Exception:  # noqa: BLE001
+                pass
+            # Rebuild may have swapped channel/cb while we unsubscribed.
+            if cb is not self._active_cb or channel is not self.channel:
+                return
+            try:
+                channel.subscribe(cb, try_to_connect=True)
+            except Exception:  # noqa: BLE001
+                pass
 
     def close(self):
         """Best-effort channel teardown on agent stop (Node shutdownNow parity)."""
-        try:
-            self.channel.unsubscribe(self._cb)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.channel.close()
-        except Exception:  # noqa: BLE001
-            pass
+        self._dns_stop.set()
+        channel = None
+        with self._channel_lock:
+            # Invalidate in-flight subscribe callbacks before close.
+            self._channel_generation += 1
+            cb = self._active_cb
+            channel = self.channel
+            self._active_cb = None
+            try:
+                if cb is not None:
+                    channel.unsubscribe(cb)
+            except Exception:  # noqa: BLE001
+                pass
+        # Close outside the lock: C-core close can block; do not stall DNS/on_error.
+        if channel is not None:
+            try:
+                channel.close()
+            except Exception:  # noqa: BLE001
+                pass
+        # Join outside the lock: the DNS thread may be waiting on the same lock.
+        thread = self._dns_thread
+        if thread is not None and thread.is_alive():
+            # After _dns_stop, the thread may still finish an in-flight resolve
+            # (up to DNS_LOOKUP_TIMEOUT_SEC per configured backend hostname).
+            thread.join(timeout=dns_reresolve_join_timeout_sec())
 
     def report_segment(self, queue: Queue, block: bool = True):
         # Gate before dequeue so disconnect windows keep segments in the queue (Node buffer parity).

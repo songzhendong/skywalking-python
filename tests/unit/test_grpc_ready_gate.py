@@ -47,7 +47,7 @@ class TestSyncGrpcReadyGate(unittest.TestCase):
 
         protocol.properties_sent = True
         protocol.service_management.sent_properties_counter = 7
-        protocol._cb(grpc.ChannelConnectivity.TRANSIENT_FAILURE)
+        protocol._active_cb(grpc.ChannelConnectivity.TRANSIENT_FAILURE)
         self.assertFalse(protocol.properties_sent)
         self.assertEqual(protocol.service_management.sent_properties_counter, 0)
 

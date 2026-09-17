@@ -120,7 +120,57 @@ _AUTH_LOG_INTERVAL_SEC = 60.0
 _last_auth_log_at = 0.0
 _CONNECTIVITY_LOG_INTERVAL_SEC = 30.0
 _last_connectivity_log_at: Dict[str, float] = {}
-_DNS_LOOKUP_TIMEOUT_SEC = 5.0
+# Bound DNS wait (startup, periodic re-resolve, and sync DNS-thread join budget).
+DNS_LOOKUP_TIMEOUT_SEC = 5.0
+_DNS_LOOKUP_TIMEOUT_SEC = DNS_LOOKUP_TIMEOUT_SEC
+# Periodic re-resolve can hit the same NXDOMAIN every interval; do not warn each tick.
+_DNS_KEEP_PREVIOUS_LOG_INTERVAL_SEC = 60.0
+_last_dns_keep_previous_log_at = 0.0
+_DNS_RERESOLVE_FAIL_LOG_INTERVAL_SEC = 60.0
+_last_dns_reresolve_fail_log_at = 0.0
+
+
+def dns_reresolve_join_timeout_sec(services: Optional[str] = None) -> float:
+    """
+    Upper bound for joining the sync DNS re-resolve thread after stop.
+
+    Budget scales with hostname backends only (literal IPs do not call getaddrinfo
+    in the periodic path). Always at least one lookup slot + 2s slack.
+    """
+    from skywalking import config
+
+    raw = config.agent_collector_backend_services if services is None else services
+    hostname_count = sum(
+        1 for addr in parse_backend_addresses(raw or '')
+        if addr.kind == AddressKind.HOSTNAME
+    )
+    return DNS_LOOKUP_TIMEOUT_SEC * max(1, hostname_count) + 2.0
+
+
+def log_dns_keep_previous_throttled(raw, fingerprint) -> None:
+    """Warn when a re-resolve keeps the live dial plan; rate-limit sustained NXDOMAIN."""
+    global _last_dns_keep_previous_log_at
+    now = time.monotonic()
+    if now - _last_dns_keep_previous_log_at < _DNS_KEEP_PREVIOUS_LOG_INTERVAL_SEC:
+        return
+    _last_dns_keep_previous_log_at = now
+    logger.warning(
+        'Collector DNS expansion of %r incomplete or empty; '
+        'keeping previous dial plan %s',
+        raw,
+        fingerprint,
+    )
+
+
+def log_dns_reresolve_failure_throttled(message: str) -> None:
+    """Rate-limit unexpected periodic DNS rebuild failures (with stack)."""
+    global _last_dns_reresolve_fail_log_at
+    now = time.monotonic()
+    if now - _last_dns_reresolve_fail_log_at < _DNS_RERESOLVE_FAIL_LOG_INTERVAL_SEC:
+        return
+    _last_dns_reresolve_fail_log_at = now
+    logger.exception(message)
+
 
 # Thread-local: set while create_*_channel builds the agent→OAP channel so sw_grpc
 # does not attach client interceptors (multi-address targets no longer match config).
@@ -255,7 +305,7 @@ def sw_static_endpoints(addresses: Sequence[BackendAddress]) -> List[Dict]:
     ]
 
 
-def _lookup_hostname(host: str, port: int) -> List[BackendAddress]:
+def _lookup_hostname(host: str, port: int, *, log_failures: bool = True) -> List[BackendAddress]:
     """
     Resolve hostname to BackendAddress IPs (order preserved, duplicates dropped).
 
@@ -263,9 +313,17 @@ def _lookup_hostname(host: str, port: int) -> List[BackendAddress]:
     must not block agent startup or process exit — bound the wait and run the
     lookup on a daemon thread (ThreadPoolExecutor workers are non-daemon and
     would keep the process alive after timeout).
+
+    When ``log_failures`` is false (periodic re-resolve with a live dial plan),
+    skip per-host error logs; the caller emits a throttled keep-previous warning.
     """
     import threading
     from concurrent.futures import Future, TimeoutError as FuturesTimeout
+
+    def _fail(message: str, *args) -> List[BackendAddress]:
+        if log_failures:
+            logger.error(message, *args)
+        return []
 
     fut: Future = Future()
 
@@ -280,29 +338,26 @@ def _lookup_hostname(host: str, port: int) -> List[BackendAddress]:
     try:
         infos = fut.result(timeout=_DNS_LOOKUP_TIMEOUT_SEC)
     except FuturesTimeout:
-        logger.error(
+        return _fail(
             'Timed out resolving collector hostname %r:%s after %.1fs; skipping this backend',
             host,
             port,
             _DNS_LOOKUP_TIMEOUT_SEC,
         )
-        return []
     except socket.gaierror as exc:
-        logger.error(
+        return _fail(
             'Failed to resolve collector hostname %r:%s (%s); skipping this backend',
             host,
             port,
             exc,
         )
-        return []
     except Exception as exc:  # noqa: BLE001 - never crash agent init on DNS oddities
-        logger.error(
+        return _fail(
             'Unexpected error resolving collector hostname %r:%s (%s); skipping this backend',
             host,
             port,
             exc,
         )
-        return []
 
     resolved: List[BackendAddress] = []
     seen = set()
@@ -330,7 +385,7 @@ def _lookup_hostname(host: str, port: int) -> List[BackendAddress]:
         seen.add(key)
         resolved.append(BackendAddress(host=ip, port=port, kind=kind))
     if not resolved:
-        logger.error(
+        return _fail(
             'Collector hostname %r:%s resolved to no usable IPv4/IPv6 address; skipping',
             host,
             port,
@@ -399,20 +454,41 @@ def encode_sw_static_for_c_core(addresses: Sequence[BackendAddress]) -> str:
 
 def prepare_grpc_channel_endpoints(
     addresses: Sequence[BackendAddress],
+    *,
+    force_static_ips: bool = False,
+    require_all_hostnames: bool = False,
 ) -> Tuple[str, str]:
     """
     Build (channel_target, default_authority) from parsed backends.
 
     Authority prefers the first *usable* original entry's host:port (hostname kept
-    for :authority / TLS peer-name when that name resolved). Never points at a
-    hostname that DNS skipped.
+    for TLS SAN when that name resolved). Never points at a hostname that DNS skipped.
+
+    When ``force_static_ips`` is true (periodic DNS mode), hostnames are always
+    expanded and encoded as C-core static ipv4:/ipv6: targets — including a
+    single hostname — so a later re-resolve can detect IP-set changes.
+
+    When ``require_all_hostnames`` is true (re-resolve with a live dial plan), any
+    configured hostname that fails lookup raises ``ValueError`` so the caller can
+    keep the previous plan instead of silently shrinking the static IP set.
+    Bootstrap (``require_all_hostnames=False``) still skips failed names.
     """
     if not addresses:
         raise ValueError(
             'No valid collector backend address in SW_AGENT_COLLECTOR_BACKEND_SERVICES'
         )
 
-    if len(addresses) == 1:
+    use_static = force_static_ips or len(addresses) > 1
+    if not use_static:
+        ep = addresses[0].endpoint()
+        return ep, ep
+
+    # Single literal IP with force_static_ips: plain target is enough (no DNS).
+    if (
+        force_static_ips
+        and len(addresses) == 1
+        and addresses[0].kind != AddressKind.HOSTNAME
+    ):
         ep = addresses[0].endpoint()
         return ep, ep
 
@@ -422,8 +498,16 @@ def prepare_grpc_channel_endpoints(
 
     for orig in addresses:
         if orig.kind == AddressKind.HOSTNAME:
-            candidates = _lookup_hostname(orig.host, orig.port)
+            # Re-resolve (require_all): suppress per-host errors; caller throttles
+            # a single keep-previous warning instead of logging every check tick.
+            candidates = _lookup_hostname(
+                orig.host, orig.port, log_failures=not require_all_hostnames,
+            )
             if not candidates:
+                if require_all_hostnames:
+                    raise ValueError(
+                        f'Failed to resolve collector hostname {orig.host!r}:{orig.port}'
+                    )
                 continue
             if authority is None:
                 # Prefer original hostname for :authority / SNI (Node sw-static style).
@@ -447,28 +531,62 @@ def prepare_grpc_channel_endpoints(
     if authority is None:
         authority = to_encode[0].endpoint()
 
+    # Stable order so a DNS re-resolve with the same A/AAAA set does not
+    # rebuild solely because getaddrinfo shuffled results (pick_first still
+    # shuffles the preferred backend via service_config).
+    to_encode.sort(key=lambda a: (a.kind.value, a.host, a.port))
+
     if any(a.kind == AddressKind.HOSTNAME for a in addresses):
-        logger.info(
-            'Expanded multi-backend collector addresses %s -> %s (authority=%s)',
+        logger.debug(
+            'Expanded collector addresses %s -> %s (authority=%s, force_static_ips=%s)',
             [a.endpoint() for a in addresses],
             [a.endpoint() for a in to_encode],
             authority,
+            force_static_ips,
         )
     return encode_sw_static_for_c_core(to_encode), authority
 
 
-def _resolve_channel_target_and_authority() -> Tuple[str, str]:
+def _force_static_ips_from_config() -> bool:
+    from skywalking import config
+
+    return bool(config.agent_collector_is_resolve_dns_periodically)
+
+
+def resolve_collector_dial_plan(
+    services: Optional[str] = None,
+    *,
+    previous: Optional[Tuple[str, str, Tuple[str, str]]] = None,
+) -> Tuple[str, str, Tuple[str, str]]:
     """
-    Never raise into the host app. prepare_grpc_channel_endpoints stays strict;
-    factories degrade so the agent can idle behind the READY gate.
+    Resolve (channel_target, default_authority, fingerprint).
+
+    ``fingerprint`` is ``(target, authority)``. When periodic DNS is on, hostnames
+    become static ipv4:/ipv6: targets, so a later re-resolve that sees new A/AAAA
+    records produces a different target and triggers a channel rebuild.
+
+    If DNS expansion fails and ``previous`` is provided, that plan is kept so a
+    transient resolver blip does not flap the live channel. With ``previous``,
+    failure of *any* configured hostname also keeps the prior plan (do not
+    shrink the static set when one of several names NXDOMAINs briefly).
+    Bootstrap (no previous) still skips failed names / falls back to a plain
+    target so the agent can start. Never raises into the host app.
     """
     from skywalking import config
 
-    raw = config.agent_collector_backend_services
+    raw = config.agent_collector_backend_services if services is None else services
     addresses = parse_backend_addresses(raw)
+    force_static = _force_static_ips_from_config()
     try:
-        return prepare_grpc_channel_endpoints(addresses)
+        target, authority = prepare_grpc_channel_endpoints(
+            addresses,
+            force_static_ips=force_static,
+            require_all_hostnames=previous is not None,
+        )
     except ValueError:
+        if previous is not None:
+            log_dns_keep_previous_throttled(raw, previous[2])
+            return previous
         if addresses:
             target = addresses[0].endpoint()
             logger.error(
@@ -477,7 +595,7 @@ def _resolve_channel_target_and_authority() -> Tuple[str, str]:
                 raw,
                 target,
             )
-            return target, target
+            return target, target, (target, target)
         fallback = (raw or '').strip() or 'localhost:1'
         logger.error(
             'No valid collector backend address in %r; opening a channel to %s '
@@ -485,7 +603,14 @@ def _resolve_channel_target_and_authority() -> Tuple[str, str]:
             raw,
             fallback,
         )
-        return fallback, fallback
+        return fallback, fallback, (fallback, fallback)
+
+    return target, authority, (target, authority)
+
+
+def _resolve_channel_target_and_authority() -> Tuple[str, str]:
+    target, authority, _fp = resolve_collector_dial_plan()
+    return target, authority
 
 
 def build_grpc_target(addresses: Sequence[BackendAddress]) -> str:
@@ -510,9 +635,13 @@ def _channel_options(default_authority: str) -> Tuple[Tuple[str, int | str], ...
     return tuple(options)
 
 
-def create_sync_channel():
+def create_sync_channel(
+    target: Optional[str] = None,
+    authority: Optional[str] = None,
+):
     """Create one sync gRPC channel (caller may wrap with auth interceptor)."""
-    target, authority = _resolve_channel_target_and_authority()
+    if target is None or authority is None:
+        target, authority = _resolve_channel_target_and_authority()
     with agent_collector_channel_scope():
         try:
             credentials = grpc_ssl_credentials()
@@ -531,9 +660,14 @@ def create_sync_channel():
         return mark_agent_collector_channel(channel)
 
 
-def create_aio_channel(interceptors=None):
+def create_aio_channel(
+    interceptors=None,
+    target: Optional[str] = None,
+    authority: Optional[str] = None,
+):
     """Create one aio gRPC channel with optional interceptors."""
-    target, authority = _resolve_channel_target_and_authority()
+    if target is None or authority is None:
+        target, authority = _resolve_channel_target_and_authority()
     with agent_collector_channel_scope():
         try:
             credentials = grpc_ssl_credentials()
