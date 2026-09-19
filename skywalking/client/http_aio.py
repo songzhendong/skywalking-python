@@ -32,6 +32,16 @@ def _aiohttp_session(material=tls_mod._MATERIAL_UNSET):
     return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_ctx))
 
 
+async def _aclose_session(session) -> None:
+    """Close a long-lived ClientSession; never raise into agent shutdown."""
+    if session is None or getattr(session, 'closed', True):
+        return
+    try:
+        await session.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class HttpServiceManagementClientAsync(ServiceManagementClientAsync):
     def __init__(self):
         super().__init__()
@@ -42,19 +52,21 @@ class HttpServiceManagementClientAsync(ServiceManagementClientAsync):
         proto = collector_http_scheme(material)
         self.url_instance_props = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/management/reportProperties"
         self.url_heart_beat = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/management/keepAlive"
-        # self.client = httpx.AsyncClient()
+        # Long-lived session: never `async with self.client` (that closes the session).
         self.client = _aiohttp_session(material)
 
-    async def send_instance_props(self):
+    async def aclose(self) -> None:
+        await _aclose_session(self.client)
 
-        async with self.client as client:
-            res = await client.post(self.url_instance_props, json={
-                'service': config.agent_name,
-                'serviceInstance': config.agent_instance_name,
-                'properties': self.instance_properties,
-            })
-        if logger_debug_enabled:
-            logger.debug('heartbeat response: %s', res)
+    async def send_instance_props(self):
+        # `async with session.post(...)` closes the response, not the session.
+        async with self.client.post(self.url_instance_props, json={
+            'service': config.agent_name,
+            'serviceInstance': config.agent_instance_name,
+            'properties': self.instance_properties,
+        }) as res:
+            if logger_debug_enabled:
+                logger.debug('heartbeat response: %s', res.status)
 
     async def send_heart_beat(self):
         await self.refresh_instance_props()
@@ -65,13 +77,12 @@ class HttpServiceManagementClientAsync(ServiceManagementClientAsync):
                 config.agent_name,
                 config.agent_instance_name,
             )
-        async with self.client as client:
-            res = await client.post(self.url_heart_beat, json={
-                'service': config.agent_name,
-                'serviceInstance': config.agent_instance_name,
-            })
-        if logger_debug_enabled:
-            logger.debug('heartbeat response: %s', res)
+        async with self.client.post(self.url_heart_beat, json={
+            'service': config.agent_name,
+            'serviceInstance': config.agent_instance_name,
+        }) as res:
+            if logger_debug_enabled:
+                logger.debug('heartbeat response: %s', res.status)
 
 
 class HttpTraceSegmentReportServiceAsync(TraceSegmentReportServiceAsync):
@@ -79,54 +90,55 @@ class HttpTraceSegmentReportServiceAsync(TraceSegmentReportServiceAsync):
         material = safe_tls_pem_material()
         proto = collector_http_scheme(material)
         self.url_report = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/segment"
-        # self.client = httpx.AsyncClient()
         self.client = _aiohttp_session(material)
+
+    async def aclose(self) -> None:
+        await _aclose_session(self.client)
 
     async def report(self, generator):
         async for segment in generator:
-            async with self.client as client:
-                res = await client.post(self.url_report, json={
-                    'traceId': str(segment.related_traces[0]),
-                    'traceSegmentId': str(segment.segment_id),
-                    'service': config.agent_name,
-                    'serviceInstance': config.agent_instance_name,
-                    'isSizeLimited': segment.is_size_limited,
-                    'spans': [{
-                        'spanId': span.sid,
-                        'parentSpanId': span.pid,
-                        'startTime': span.start_time,
-                        'endTime': span.end_time,
-                        'operationName': span.op,
-                        'peer': span.peer,
-                        'spanType': span.kind.name,
-                        'spanLayer': span.layer.name,
-                        'componentId': span.component.value,
-                        'isError': span.error_occurred,
-                        'logs': [{
-                            'time': int(log.timestamp * 1000),
-                            'data': [{
-                                'key': item.key,
-                                'value': item.val,
-                            } for item in log.items],
-                        } for log in span.logs],
-                        'tags': [{
-                            'key': tag.key,
-                            'value': tag.val,
-                        } for tag in span.iter_tags()],
-                        'refs': [{
-                            'refType': 0,
-                            'traceId': ref.trace_id,
-                            'parentTraceSegmentId': ref.segment_id,
-                            'parentSpanId': ref.span_id,
-                            'parentService': ref.service,
-                            'parentServiceInstance': ref.service_instance,
-                            'parentEndpoint': ref.endpoint,
-                            'networkAddressUsedAtPeer': ref.client_address,
-                        } for ref in span.refs if ref.trace_id]
-                    } for span in segment.spans]
-                })
-            if logger_debug_enabled:
-                logger.debug('report traces response: %s', res)
+            async with self.client.post(self.url_report, json={
+                'traceId': str(segment.related_traces[0]),
+                'traceSegmentId': str(segment.segment_id),
+                'service': config.agent_name,
+                'serviceInstance': config.agent_instance_name,
+                'isSizeLimited': segment.is_size_limited,
+                'spans': [{
+                    'spanId': span.sid,
+                    'parentSpanId': span.pid,
+                    'startTime': span.start_time,
+                    'endTime': span.end_time,
+                    'operationName': span.op,
+                    'peer': span.peer,
+                    'spanType': span.kind.name,
+                    'spanLayer': span.layer.name,
+                    'componentId': span.component.value,
+                    'isError': span.error_occurred,
+                    'logs': [{
+                        'time': int(log.timestamp * 1000),
+                        'data': [{
+                            'key': item.key,
+                            'value': item.val,
+                        } for item in log.items],
+                    } for log in span.logs],
+                    'tags': [{
+                        'key': tag.key,
+                        'value': tag.val,
+                    } for tag in span.iter_tags()],
+                    'refs': [{
+                        'refType': 0,
+                        'traceId': ref.trace_id,
+                        'parentTraceSegmentId': ref.segment_id,
+                        'parentSpanId': ref.span_id,
+                        'parentService': ref.service,
+                        'parentServiceInstance': ref.service_instance,
+                        'parentEndpoint': ref.endpoint,
+                        'networkAddressUsedAtPeer': ref.client_address,
+                    } for ref in span.refs if ref.trace_id]
+                } for span in segment.spans]
+            }) as res:
+                if logger_debug_enabled:
+                    logger.debug('report traces response: %s', res.status)
 
 
 class HttpLogDataReportServiceAsync(LogDataReportServiceAsync):
@@ -134,13 +146,14 @@ class HttpLogDataReportServiceAsync(LogDataReportServiceAsync):
         material = safe_tls_pem_material()
         proto = collector_http_scheme(material)
         self.url_report = f"{proto}{config.agent_collector_backend_services.rstrip('/')}/v3/logs"
-        # self.client = httpx.AsyncClient()
         self.client = _aiohttp_session(material)
+
+    async def aclose(self) -> None:
+        await _aclose_session(self.client)
 
     async def report(self, generator):
         log_batch = [json.loads(json_format.MessageToJson(log_data)) async for log_data in generator]
         if log_batch:  # prevent empty batches
-            async with self.client as client:
-                res = await client.post(self.url_report, json=log_batch)
-            if logger_debug_enabled:
-                logger.debug('report batch log response: %s', res)
+            async with self.client.post(self.url_report, json=log_batch) as res:
+                if logger_debug_enabled:
+                    logger.debug('report batch log response: %s', res.status)
