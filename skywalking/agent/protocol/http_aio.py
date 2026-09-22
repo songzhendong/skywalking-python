@@ -32,6 +32,13 @@ class HttpProtocolAsync(ProtocolAsync):
         self.traces_reporter = HttpTraceSegmentReportServiceAsync()
         self.log_reporter = HttpLogDataReportServiceAsync()
 
+    async def aclose(self) -> None:
+        # Close long-lived aiohttp ClientSessions owned by the HTTP clients.
+        for part in (self.service_management, self.traces_reporter, self.log_reporter):
+            aclose = getattr(part, 'aclose', None)
+            if callable(aclose):
+                await aclose()
+
     async def heartbeat(self):
         if not self.properties_sent.is_set():
             logger.debug('Sending instance properties')

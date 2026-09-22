@@ -46,7 +46,7 @@ def install():
 
         if config.agent_protocol == 'http' and config.agent_collector_backend_services.rstrip('/') \
                 .endswith(f'{url.host}:{url.port}'):
-            return _request
+            return await _request(self, method, str_or_url, **kwargs)
 
         span = NoopSpan(NoopContext()) if config.ignore_http_method_check(method) \
             else get_context().new_exit_span(op=url.path or '/', peer=peer, component=Component.AioHttp)
