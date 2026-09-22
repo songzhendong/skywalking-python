@@ -1,0 +1,48 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Real OAP CDS: agent is already running (bootstrap sample_n=0), etcd updates
+# agent.sample_n_per_3_secs to 1, and a burst must not all be reported.
+# Runs as its own CI job in parallel with the main e2e matrix (one Python version).
+#
+# No HTTP trigger: infra-e2e keeps firing until the case ends (times only gates
+# verify start). Sampling is process-wide, so background traffic steals the
+# rate=1 quota and either inflates or zeros the /pid count. All /pid load is
+# in push-and-burst.sh instead.
+
+setup:
+  env: compose
+  file: docker-compose.cds.yaml
+  timeout: 20m
+  init-system-environment: ../../../script/env
+  steps:
+    - name: install yq
+      command: bash tests/e2e/script/prepare/install.sh yq
+    - name: install swctl
+      command: bash tests/e2e/script/prepare/install.sh swctl
+
+verify:
+  retry:
+    count: 15
+    interval: 10s
+  cases:
+    - name: push CDS sampling rate and burst without restarting the agent
+      query: bash tests/e2e/case/grpc/cds/push-and-burst.sh
+      expected: expected/push-ok.yml
+    - name: burst is sampled down to the dynamic rate
+      query: bash tests/e2e/case/grpc/cds/verify-sampling.sh
+      expected: expected/sampled-count.yml
