@@ -19,6 +19,7 @@ import asyncio
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest.mock import patch
 
 from skywalking import config
 
@@ -111,6 +112,42 @@ class TestAsyncHttpClientSession(unittest.TestCase):
             asyncio.run(run())
         finally:
             server.shutdown()
+
+    def test_async_http_heartbeat_with_aiohttp_plugin_installed(self):
+        from aiohttp import ClientSession
+        from aiohttp.web_protocol import RequestHandler
+
+        from skywalking.agent.protocol.http_aio import HttpProtocolAsync
+        from skywalking.plugins import sw_aiohttp
+
+        self.addCleanup(setattr, ClientSession, '_request', ClientSession._request)
+        self.addCleanup(setattr, RequestHandler, '_handle_request', RequestHandler._handle_request)
+        sw_aiohttp.install()
+
+        server, port = _start_http_server()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        config.agent_collector_backend_services = f'127.0.0.1:{port}'
+
+        async def run():
+            protocol = HttpProtocolAsync()
+            sessions = [part.client for part in (
+                protocol.service_management, protocol.traces_reporter, protocol.log_reporter,
+            )]
+            try:
+                await asyncio.wait_for(protocol.heartbeat(), timeout=5)
+                await asyncio.wait_for(protocol.heartbeat(), timeout=5)
+                self.assertTrue(all(not session.closed for session in sessions))
+            finally:
+                await protocol.aclose()
+            self.assertTrue(all(session.closed for session in sessions))
+
+        with patch.object(_OkHandler, 'do_POST', autospec=True, side_effect=_OkHandler.do_POST) as post, \
+                patch.object(sw_aiohttp, 'get_context') as get_context, \
+                patch.object(config, 'agent_collector_properties_report_period_factor', 10):
+            asyncio.run(run())
+            self.assertEqual(post.call_count, 3)
+            get_context.assert_not_called()
 
 
 if __name__ == '__main__':
