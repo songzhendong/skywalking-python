@@ -350,6 +350,45 @@ jobs:
           name: e2e_logs_gRPC-failover_${{ matrix.python-image-variant }}
           path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
 
+  # Own job, parallel with e2e-tests / e2e-failover. One Python version so this
+  # does not multiply the main matrix (5 versions) and does not extend its wall clock.
+  e2e-cds:
+    name: E2E CDS
+    needs: [ license-and-lint, changes, plugin-doc-check, docker-e2e ]
+    if: |
+      ( always() && ! cancelled() ) &&
+      ((github.event_name == 'schedule' && github.repository == 'apache/skywalking-python') || needs.changes.outputs.agent == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-image-variant: [ "3.12-slim" ]
+      fail-fast: false
+    steps:
+      - name: Checkout source codes
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Pull SkyWalking Python agent base image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-images-skywalking-python-e2e-${{ matrix.python-image-variant }}
+          path: docker-images
+      - name: Load docker images
+        run: find docker-images -name "*.tar" -exec docker load -i {} \;
+      - name: Run CDS E2E
+        uses: apache/skywalking-infra-e2e@cf589b4a0b9f8e6f436f78e9cfd94a1ee5494180
+        with:
+          log-dir: /tmp/e2e-logs
+          e2e-file: tests/e2e/case/grpc/cds/e2e.yaml
+      - name: Upload Logs
+        uses: actions/upload-artifact@v4
+        if: ${{ failure() || cancelled() }}
+        with:
+          name: e2e_logs_gRPC-cds_${{ matrix.python-image-variant }}
+          path: "${{ env.SW_INFRA_E2E_LOG_DIR }}"
+
 
   CheckStatus:
     # a required check that must pass before merging a PR
@@ -357,7 +396,7 @@ jobs:
     timeout-minutes: 60
     # wait upon them regardless of success or skipped or failure
     if: ${{ always() }}
-    needs: [ license-and-lint, changes, plugin-and-unit-tests, plugin-doc-check, e2e-tests, e2e-failover ]
+    needs: [ license-and-lint, changes, plugin-and-unit-tests, plugin-doc-check, e2e-tests, e2e-failover, e2e-cds ]
     steps:
       - name: Merge Requirement
         # check license, lint, plugin and e2e tests, then naturally exits 0
@@ -367,10 +406,12 @@ jobs:
           pluginResults=${{ needs.plugin-and-unit-tests.result }};
           e2eResults=${{ needs.e2e-tests.result }};
           e2eFailoverResults=${{ needs.e2e-failover.result }};
+          e2eCdsResults=${{ needs.e2e-cds.result }};
           docCheckResults=${{ needs.plugin-doc-check.result }};
           [[ ${lintResults} == 'success' ]] || exit 2;
           [[ ${docCheckResults} == 'success' ]] || exit 3;
           [[ ${pluginResults} == 'success' ]] || [[ ${execute} != 'true' && ${pluginResults} == 'skipped' ]] || exit 4;
           [[ ${e2eResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eResults} == 'skipped' ]] || exit 5;
           [[ ${e2eFailoverResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eFailoverResults} == 'skipped' ]] || exit 6;
+          [[ ${e2eCdsResults} == 'success' ]] || [[ ${execute} != 'true' && ${e2eCdsResults} == 'skipped' ]] || exit 7;
           exit 0;

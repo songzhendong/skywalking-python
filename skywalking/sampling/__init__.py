@@ -35,6 +35,8 @@ def init(force: bool = False):
 
     logger.debug('Initializing sampling service')
     sampling_service = SamplingService()
+    # force=True (fork remount): replace CDS watcher so the child is not stuck on the parent instance.
+    sampling_service.register_cds_watcher(replace=force)
     sampling_service.start()
 
 
@@ -43,7 +45,10 @@ async def init_async(async_event: Optional[asyncio.Event] = None):
 
     global sampling_service
 
+    # Always a new service instance; rebind CDS watcher if one was already registered.
+    replace = sampling_service is not None
     sampling_service = SamplingServiceAsync()
+    sampling_service.register_cds_watcher(replace=replace)
     if async_event is not None:
         async_event.set()
     task = asyncio.create_task(sampling_service.start())

@@ -145,10 +145,16 @@ agent_sw_python_cli_debug_enabled = os.getenv('SW_AGENT_SW_PYTHON_CLI_DEBUG_ENAB
 agent_trace_reporter_max_buffer_size: int = int(os.getenv('SW_AGENT_TRACE_REPORTER_MAX_BUFFER_SIZE', '10000'))
 # You can setup multiple URL path patterns, The endpoints match these patterns wouldn't be traced. the current
 # matching rules follow Ant Path match style , like /path/*, /path/**, /path/?.
+# gRPC CDS key agent.trace.ignore_path overrides this at runtime. See
+# [CDS setup](advanced/ConfigurationDiscovery.md).
 agent_trace_ignore_path: str = os.getenv('SW_AGENT_TRACE_IGNORE_PATH', '')
 # If the operation name of the first span is included in this set, this segment should be ignored.
+# gRPC CDS key agent.ignore_suffix overrides this at runtime.
 agent_ignore_suffix: str = os.getenv('SW_AGENT_IGNORE_SUFFIX', '.jpg,.jpeg,.js,.css,.png,.bmp,.gif,.ico,.mp3,'
                                                                '.mp4,.html,.svg ')
+# Max spans kept in one segment. Further spans are dropped and the segment is marked size-limited.
+# <= 0 disables the cap. gRPC CDS key agent.span_limit_per_segment. Default matches Java (300).
+agent_span_limit_per_segment: int = int(os.getenv('SW_AGENT_SPAN_LIMIT_PER_SEGMENT', '300'))
 # Max element count of the correlation context.
 correlation_element_max_number: int = int(os.getenv('SW_CORRELATION_ELEMENT_MAX_NUMBER', '3'))
 # Max value length of correlation context element.
@@ -159,6 +165,12 @@ correlation_value_max_length: int = int(os.getenv('SW_CORRELATION_VALUE_MAX_LENG
 agent_profile_active: bool = os.getenv('SW_AGENT_PROFILE_ACTIVE', '').lower() != 'false'
 # The number of seconds between two profile task query.
 agent_collector_get_profile_task_interval: int = int(os.getenv('SW_AGENT_COLLECTOR_GET_PROFILE_TASK_INTERVAL', '20'))
+# Seconds between CDS (Configuration Discovery Service) polls for dynamic agent
+# config such as agent.sample_n_per_3_secs. gRPC protocol only. See
+# [CDS setup](advanced/ConfigurationDiscovery.md).
+agent_collector_get_agent_dynamic_config_interval: int = int(
+    os.getenv('SW_AGENT_COLLECTOR_GET_AGENT_DYNAMIC_CONFIG_INTERVAL', '20')
+)
 # The number of parallel monitor segment count.
 agent_profile_max_parallel: int = int(os.getenv('SW_AGENT_PROFILE_MAX_PARALLEL', '5'))
 # The maximum monitor segment time(minutes), if current segment monitor time out of limit, then stop it.
@@ -216,7 +228,8 @@ plugin_http_http_params_length_threshold: int = int(
 # Comma-delimited list of http methods to ignore (GET, POST, HEAD, OPTIONS, etc...)
 plugin_http_ignore_method: str = os.getenv('SW_PLUGIN_HTTP_IGNORE_METHOD', '').upper()
 # The maximum length of the collected parameter, parameters longer than the specified length will be truncated,
-# length 0 turns off parameter tracing
+# length 0 turns off parameter tracing. gRPC CDS key plugin.jdbc.trace_sql_parameters is the Java boolean
+# (true enables collection, false disables). See [CDS setup](advanced/ConfigurationDiscovery.md).
 plugin_sql_parameters_max_length: int = int(os.getenv('SW_PLUGIN_SQL_PARAMETERS_MAX_LENGTH', '0'))
 # Indicates whether to collect the filters of pymongo
 plugin_pymongo_trace_parameters: bool = os.getenv('SW_PLUGIN_PYMONGO_TRACE_PARAMETERS', '').lower() == 'true'
@@ -240,7 +253,9 @@ plugin_celery_parameters_length: int = int(os.getenv('SW_PLUGIN_CELERY_PARAMETER
 plugin_grpc_ignored_methods: str = os.getenv('SW_PLUGIN_GRPC_IGNORED_METHODS', '').upper()
 
 # BEGIN: Sampling Configurations
-# The number of samples to take in every 3 seconds, 0 turns off
+# The number of samples to take in every 3 seconds, 0 turns off. Bootstrap value;
+# gRPC CDS may override agent.sample_n_per_3_secs at runtime without restart.
+# See [CDS setup](advanced/ConfigurationDiscovery.md).
 sample_n_per_3_secs: int = int(os.getenv('SW_SAMPLE_N_PER_3_SECS', '0'))
 
 # THIS MUST FOLLOW DIRECTLY AFTER LIST OF CONFIG OPTIONS!

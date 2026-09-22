@@ -53,8 +53,9 @@ export SW_AGENT_YourConfiguration=YourValue
 | Configuration | Environment Variable | Type | Default Value | Description |
 | :------------ | :------------ | :------------ | :------------ | :------------ |
 | agent_trace_reporter_max_buffer_size | SW_AGENT_TRACE_REPORTER_MAX_BUFFER_SIZE | <class 'int'> | 10000 | The maximum queue backlog size for sending the segment data to backend, segments beyond this are silently dropped |
-| agent_trace_ignore_path | SW_AGENT_TRACE_IGNORE_PATH | <class 'str'> |  | You can setup multiple URL path patterns, The endpoints match these patterns wouldn't be traced. the current matching rules follow Ant Path match style , like /path/*, /path/**, /path/?. |
-| agent_ignore_suffix | SW_AGENT_IGNORE_SUFFIX | <class 'str'> | .jpg,.jpeg,.js,.css,.png,.bmp,.gif,.ico,.mp3,.mp4,.html,.svg  | If the operation name of the first span is included in this set, this segment should be ignored. |
+| agent_trace_ignore_path | SW_AGENT_TRACE_IGNORE_PATH | <class 'str'> |  | You can setup multiple URL path patterns, The endpoints match these patterns wouldn't be traced. the current matching rules follow Ant Path match style , like /path/*, /path/**, /path/?. gRPC CDS key agent.trace.ignore_path overrides this at runtime. See [CDS setup](advanced/ConfigurationDiscovery.md). |
+| agent_ignore_suffix | SW_AGENT_IGNORE_SUFFIX | <class 'str'> | .jpg,.jpeg,.js,.css,.png,.bmp,.gif,.ico,.mp3,.mp4,.html,.svg  | If the operation name of the first span is included in this set, this segment should be ignored. gRPC CDS key agent.ignore_suffix overrides this at runtime. |
+| agent_span_limit_per_segment | SW_AGENT_SPAN_LIMIT_PER_SEGMENT | <class 'int'> | 300 | Max spans kept in one segment. Further spans are dropped and the segment is marked size-limited. <= 0 disables the cap. gRPC CDS key agent.span_limit_per_segment. Default matches Java (300). |
 | correlation_element_max_number | SW_CORRELATION_ELEMENT_MAX_NUMBER | <class 'int'> | 3 | Max element count of the correlation context. |
 | correlation_value_max_length | SW_CORRELATION_VALUE_MAX_LENGTH | <class 'int'> | 128 | Max value length of correlation context element. |
 ###  Profiling Configurations
@@ -62,6 +63,7 @@ export SW_AGENT_YourConfiguration=YourValue
 | :------------ | :------------ | :------------ | :------------ | :------------ |
 | agent_profile_active | SW_AGENT_PROFILE_ACTIVE | <class 'bool'> | True | If `True`, Python agent will enable profiler when user create a new profiling task. |
 | agent_collector_get_profile_task_interval | SW_AGENT_COLLECTOR_GET_PROFILE_TASK_INTERVAL | <class 'int'> | 20 | The number of seconds between two profile task query. |
+| agent_collector_get_agent_dynamic_config_interval | SW_AGENT_COLLECTOR_GET_AGENT_DYNAMIC_CONFIG_INTERVAL | <class 'int'> | 20 | Seconds between CDS (Configuration Discovery Service) polls for dynamic agent config such as agent.sample_n_per_3_secs. gRPC protocol only. See [CDS setup](advanced/ConfigurationDiscovery.md). |
 | agent_profile_max_parallel | SW_AGENT_PROFILE_MAX_PARALLEL | <class 'int'> | 5 | The number of parallel monitor segment count. |
 | agent_profile_duration | SW_AGENT_PROFILE_DURATION | <class 'int'> | 10 | The maximum monitor segment time(minutes), if current segment monitor time out of limit, then stop it. |
 | agent_profile_dump_max_stack_depth | SW_AGENT_PROFILE_DUMP_MAX_STACK_DEPTH | <class 'int'> | 500 | The number of max dump thread stack depth |
@@ -90,7 +92,7 @@ export SW_AGENT_YourConfiguration=YourValue
 | agent_disable_plugins | SW_AGENT_DISABLE_PLUGINS | <class 'list'> | [''] | The name patterns in comma-separated pattern, plugins whose name matches one of the pattern won't be installed |
 | plugin_http_http_params_length_threshold | SW_PLUGIN_HTTP_HTTP_PARAMS_LENGTH_THRESHOLD | <class 'int'> | 1024 | When `COLLECT_HTTP_PARAMS` is enabled, how many characters to keep and send to the OAP backend, use negative values to keep and send the complete parameters, NB. this config item is added for the sake of performance. |
 | plugin_http_ignore_method | SW_PLUGIN_HTTP_IGNORE_METHOD | <class 'str'> |  | Comma-delimited list of http methods to ignore (GET, POST, HEAD, OPTIONS, etc...) |
-| plugin_sql_parameters_max_length | SW_PLUGIN_SQL_PARAMETERS_MAX_LENGTH | <class 'int'> | 0 | The maximum length of the collected parameter, parameters longer than the specified length will be truncated, length 0 turns off parameter tracing |
+| plugin_sql_parameters_max_length | SW_PLUGIN_SQL_PARAMETERS_MAX_LENGTH | <class 'int'> | 0 | The maximum length of the collected parameter, parameters longer than the specified length will be truncated, length 0 turns off parameter tracing. gRPC CDS key plugin.jdbc.trace_sql_parameters is the Java boolean (true enables collection, false disables). See [CDS setup](advanced/ConfigurationDiscovery.md). |
 | plugin_pymongo_trace_parameters | SW_PLUGIN_PYMONGO_TRACE_PARAMETERS | <class 'bool'> | False | Indicates whether to collect the filters of pymongo |
 | plugin_pymongo_parameters_max_length | SW_PLUGIN_PYMONGO_PARAMETERS_MAX_LENGTH | <class 'int'> | 512 | The maximum length of the collected filters, filters longer than the specified length will be truncated |
 | plugin_elasticsearch_trace_dsl | SW_PLUGIN_ELASTICSEARCH_TRACE_DSL | <class 'bool'> | False | If true, trace all the DSL(Domain Specific Language) in ElasticSearch access, default is false |
@@ -104,4 +106,4 @@ export SW_AGENT_YourConfiguration=YourValue
 ###  Sampling Configurations
 | Configuration | Environment Variable | Type | Default Value | Description |
 | :------------ | :------------ | :------------ | :------------ | :------------ |
-| sample_n_per_3_secs | SW_SAMPLE_N_PER_3_SECS | <class 'int'> | 0 | The number of samples to take in every 3 seconds, 0 turns off |
+| sample_n_per_3_secs | SW_SAMPLE_N_PER_3_SECS | <class 'int'> | 0 | The number of samples to take in every 3 seconds, 0 turns off. Bootstrap value; gRPC CDS may override agent.sample_n_per_3_secs at runtime without restart. See [CDS setup](advanced/ConfigurationDiscovery.md). |
