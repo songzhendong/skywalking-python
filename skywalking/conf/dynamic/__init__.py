@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-from skywalking.conf.dynamic.configuration_discovery_service import (
+from skywalking.conf.dynamic.configuration_discovery import (
     ConfigurationDiscoveryService,
     configuration_discovery_service,
 )

@@ -151,8 +151,6 @@ class SpanContext:
             return span
 
         parent = self.peek()
-        if self._span_limit_reached():
-            return NoopSpan(context=NoopContext())
         # start profiling if profile_context is set
         if config.agent_profile_active and self.profile_status is None:
             self.profile_status = profile.profile_task_execution_service.add_profiling(self,
@@ -168,6 +166,8 @@ class SpanContext:
             span.op = op
 
         else:
+            if self._span_limit_reached():
+                return NoopSpan(context=NoopContext())
             span = self.new_span(parent, EntrySpan, op=op)
 
             if carrier is not None and carrier.is_valid:  # TODO: should this be done irrespective of inheritance?
@@ -182,8 +182,6 @@ class SpanContext:
             return span
 
         parent = self.peek()
-        if self._span_limit_reached():
-            return NoopSpan(context=NoopContext())
         if parent is not None and parent.kind.is_exit and component == parent.inherit:
             span = parent
             span.op = op
@@ -191,6 +189,8 @@ class SpanContext:
             span.component = component
 
         else:
+            if self._span_limit_reached():
+                return NoopSpan(context=NoopContext())
             span = self.new_span(parent, ExitSpan, op=op, peer=peer, component=component)
 
         if inherit:

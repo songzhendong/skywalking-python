@@ -16,9 +16,8 @@
 #
 
 from skywalking.command.base_command import BaseCommand
-from skywalking.command.configuration_discovery_command import ConfigurationDiscoveryCommand
 from skywalking.command.executors.command_executor import CommandExecutor
-from skywalking.conf.dynamic import configuration_discovery_service
+from skywalking.conf.dynamic.configuration_discovery import configuration_discovery_service
 from skywalking.loggings import logger
 
 
@@ -26,8 +25,7 @@ class ConfigurationDiscoveryCommandExecutor(CommandExecutor):
 
     def execute(self, command: BaseCommand) -> bool:
         try:
-            cds_command = command  # type: ConfigurationDiscoveryCommand
-            return configuration_discovery_service.handle_configuration_discovery_command(cds_command)
+            return configuration_discovery_service.handle_configuration_discovery_command(command)
         except Exception:  # noqa: BLE001 - never fail the command dispatcher
             logger.exception('Handle ConfigurationDiscoveryCommand error, command=%s', command)
             return False

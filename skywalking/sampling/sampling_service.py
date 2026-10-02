@@ -21,7 +21,11 @@ import time
 from typing import Set
 
 from skywalking import config
-from skywalking.conf.dynamic import SamplingRateWatcher, configuration_discovery_service
+from skywalking.conf.dynamic import (
+    SamplingRateWatcher,
+    configuration_discovery_service,
+    register_agent_dynamic_watchers,
+)
 from skywalking.log import logger
 
 import asyncio
@@ -40,7 +44,6 @@ class SamplingServiceBase:
         self._on = False
         self._sample_n = 0
         self._rate_watcher: SamplingRateWatcher | None = None
-        # Bootstrap from env/config; CDS watcher may override later.
         self.handle_sampling_rate_changed(config.sample_n_per_3_secs)
 
     @property
@@ -56,7 +59,6 @@ class SamplingServiceBase:
             self._rate_watcher,
             replace=replace,
         )
-        from skywalking.conf.dynamic.agent_watchers import register_agent_dynamic_watchers
         register_agent_dynamic_watchers(replace=replace)
 
     def handle_sampling_rate_changed(self, rate: int) -> None:
