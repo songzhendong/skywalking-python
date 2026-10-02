@@ -26,7 +26,8 @@ from skywalking import config
 from skywalking.agent.protocol import Protocol
 from skywalking.agent.protocol.interceptors import header_adder_interceptor
 from skywalking.client.grpc import GrpcServiceManagementClient, GrpcTraceSegmentReportService, \
-    GrpcProfileTaskChannelService, GrpcLogDataReportService, GrpcMeterReportService
+    GrpcProfileTaskChannelService, GrpcLogDataReportService, GrpcMeterReportService, \
+    GrpcConfigurationDiscoveryChannelService
 from skywalking.loggings import logger, logger_debug_enabled
 from skywalking.utils.grpc_channel import (
     apply_connectivity_transition,
@@ -86,6 +87,7 @@ class GrpcProtocol(Protocol):
         self.profile_channel = GrpcProfileTaskChannelService(self.channel)
         self.log_reporter = GrpcLogDataReportService(self.channel)
         self.meter_reporter = GrpcMeterReportService(self.channel)
+        self.configuration_discovery = GrpcConfigurationDiscoveryChannelService(self.channel)
 
         # Subscribe last: _cb runs on a grpc thread and touches service_management.
         self.channel.subscribe(self._cb, try_to_connect=True)
@@ -132,6 +134,16 @@ class GrpcProtocol(Protocol):
         if not self.is_ready():
             return
         self.profile_channel.finish(task)
+
+    def sync_agent_configurations(self):
+        if not self.is_ready():
+            return
+        if logger_debug_enabled:
+            logger.debug('sync agent configurations (CDS)')
+        try:
+            self.configuration_discovery.sync()
+        except grpc.RpcError as e:
+            handle_rpc_error(e, self.on_error)
 
     def heartbeat(self):
         if not self.is_ready():

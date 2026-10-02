@@ -26,7 +26,8 @@ from skywalking import config
 from skywalking.agent.protocol import ProtocolAsync
 from skywalking.agent.protocol.interceptors_aio import header_adder_interceptor_async
 from skywalking.client.grpc_aio import GrpcServiceManagementClientAsync, GrpcTraceSegmentReportServiceAsync, \
-    GrpcProfileTaskChannelServiceAsync, GrpcLogReportServiceAsync, GrpcMeterReportServiceAsync
+    GrpcProfileTaskChannelServiceAsync, GrpcLogReportServiceAsync, GrpcMeterReportServiceAsync, \
+    GrpcConfigurationDiscoveryChannelServiceAsync
 from skywalking.loggings import logger, logger_debug_enabled
 from skywalking.utils.reporter_log import log_dropped_throttled
 from skywalking.utils.grpc_channel import (
@@ -68,6 +69,7 @@ class GrpcProtocolAsync(ProtocolAsync):
         self.log_reporter = GrpcLogReportServiceAsync(self.channel)
         self.meter_reporter = GrpcMeterReportServiceAsync(self.channel)
         self.profile_channel = GrpcProfileTaskChannelServiceAsync(self.channel)
+        self.configuration_discovery = GrpcConfigurationDiscoveryChannelServiceAsync(self.channel)
 
     def is_ready(self) -> bool:
         """Prefer watch-maintained state; peek+nudge when IDLE/None before watch catches up."""
@@ -120,6 +122,16 @@ class GrpcProtocolAsync(ProtocolAsync):
         if not self.is_ready():
             return
         await self.profile_channel.finish(task)
+
+    async def sync_agent_configurations(self):
+        if not self.is_ready():
+            return
+        if logger_debug_enabled:
+            logger.debug('sync agent configurations (CDS)')
+        try:
+            await self.configuration_discovery.sync()
+        except grpc.aio.AioRpcError as e:
+            handle_rpc_error(e, self.on_error)
 
     async def heartbeat(self):
         if not self.is_ready():

@@ -141,6 +141,8 @@ class SpanContext:
             return span
 
         parent = self.peek()
+        if self._span_limit_reached():
+            return NoopSpan(context=NoopContext())
         return self.new_span(parent, Span, op=op, kind=Kind.Local)
 
     def new_entry_span(self, op: str, carrier: Optional[Carrier] = None, inherit: Optional[Component] = None) -> Span:
@@ -149,6 +151,8 @@ class SpanContext:
             return span
 
         parent = self.peek()
+        if self._span_limit_reached():
+            return NoopSpan(context=NoopContext())
         # start profiling if profile_context is set
         if config.agent_profile_active and self.profile_status is None:
             self.profile_status = profile.profile_task_execution_service.add_profiling(self,
@@ -178,6 +182,8 @@ class SpanContext:
             return span
 
         parent = self.peek()
+        if self._span_limit_reached():
+            return NoopSpan(context=NoopContext())
         if parent is not None and parent.kind.is_exit and component == parent.inherit:
             span = parent
             span.op = op
@@ -222,10 +228,22 @@ class SpanContext:
 
         self._nspans -= 1
         if self._nspans == 0:
-            self.segment.is_size_limited = agent.is_segment_queue_full()
+            self.segment.is_size_limited = (
+                self.segment.is_size_limited or agent.is_segment_queue_full()
+            )
             agent.archive_segment(self.segment)
             return True
 
+        return False
+
+    def _span_limit_reached(self) -> bool:
+        """Java spanLimitWatcher: drop new spans once the segment reaches the cap."""
+        limit = config.agent_span_limit_per_segment
+        if limit <= 0:
+            return False
+        if len(self.segment.spans) + self._nspans >= limit:
+            self.segment.is_size_limited = True
+            return True
         return False
 
     @staticmethod

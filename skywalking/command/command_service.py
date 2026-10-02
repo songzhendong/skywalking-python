@@ -22,7 +22,11 @@ from collections import deque
 from skywalking.protocol.common.Command_pb2 import Commands, Command
 
 from skywalking.command.base_command import BaseCommand
+from skywalking.command.configuration_discovery_command import ConfigurationDiscoveryCommand
 from skywalking.command.executors import noop_command_executor_instance
+from skywalking.command.executors.configuration_discovery_command_executor import (
+    ConfigurationDiscoveryCommandExecutor,
+)
 from skywalking.command.executors.profile_task_command_executor import ProfileTaskCommandExecutor
 from skywalking.command.profile_task_command import ProfileTaskCommand
 from skywalking.loggings import logger
@@ -40,11 +44,20 @@ class CommandService:
             # block until a command is available
             command = self._commands.get()  # type: BaseCommand
             if not self.__is_command_executed(command):
-                command_executor_service.execute(command)
-                self._command_serial_number_cache.add(command.serial_number)
+                # False means the command was rejected (invalid CDS value). Leave it
+                # out of the serial cache so the next poll can apply a correction.
+                if command_executor_service.execute(command) is not False:
+                    self.__remember_command(command)
 
     def __is_command_executed(self, command: BaseCommand):
+        # Empty serial must not poison the cache (CDS falls back to uuid short-circuit).
+        if not command.serial_number:
+            return False
         return self._command_serial_number_cache.contains(command.serial_number)
+
+    def __remember_command(self, command: BaseCommand):
+        if command.serial_number:
+            self._command_serial_number_cache.add(command.serial_number)
 
     def receive_command(self, commands: Commands):
         for command in commands.commands:
@@ -68,20 +81,27 @@ class CommandService:
 class CommandServiceAsync:
 
     def __init__(self):
+        # Create before dispatch() so CDS/profile receive_command cannot race.
+        self._commands = AsyncQueue()  # type: AsyncQueue
         # don't execute same command twice
         self._command_serial_number_cache = CommandSerialNumberCache()
 
     async def dispatch(self):
-        self._commands = AsyncQueue()  # type: AsyncQueue
         while True:
             # block until a command is available
             command = await self._commands.get()  # type: BaseCommand
             if not self.__is_command_executed(command):
-                command_executor_service.execute(command)
-                self._command_serial_number_cache.add(command.serial_number)
+                if command_executor_service.execute(command) is not False:
+                    self.__remember_command(command)
 
     def __is_command_executed(self, command: BaseCommand):
+        if not command.serial_number:
+            return False
         return self._command_serial_number_cache.contains(command.serial_number)
+
+    def __remember_command(self, command: BaseCommand):
+        if command.serial_number:
+            self._command_serial_number_cache.add(command.serial_number)
 
     def receive_command(self, commands: Commands):
         for command in commands.commands:
@@ -128,10 +148,15 @@ class CommandExecutorService:
     """
 
     def __init__(self):
-        self.__command_executor_map = {ProfileTaskCommand.NAME: ProfileTaskCommandExecutor()}
+        self.__command_executor_map = {
+            ProfileTaskCommand.NAME: ProfileTaskCommandExecutor(),
+            ConfigurationDiscoveryCommand.NAME: ConfigurationDiscoveryCommandExecutor(),
+        }
 
     def execute(self, command: BaseCommand):
-        self.__executor_for_command(command).execute(command)
+        # Propagate executor return (CDS returns False on reject) so dispatch
+        # can skip serial-cache remember and retry on the next poll.
+        return self.__executor_for_command(command).execute(command)
 
     def __executor_for_command(self, command: BaseCommand):
         executor = self.__command_executor_map.get(command.command)
@@ -148,8 +173,9 @@ class CommandDeserializer:
 
         if ProfileTaskCommand.NAME == command_name:
             return ProfileTaskCommand.deserialize(command)
-        else:
-            raise UnsupportedCommandException(command)
+        if ConfigurationDiscoveryCommand.NAME == command_name:
+            return ConfigurationDiscoveryCommand.deserialize(command)
+        raise UnsupportedCommandException(command)
 
 
 class UnsupportedCommandException(Exception):

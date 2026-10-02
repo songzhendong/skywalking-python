@@ -1,0 +1,80 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+services:
+  # No host ports: infra-e2e waits on published ports from the runner, and
+  # etcd's mapped client port is not reliably reachable that way. OAP talks
+  # to etcd on the compose network; push-and-burst.sh uses docker exec.
+  # Advertise must be the docker DNS name (not 0.0.0.0) or OAP's etcd client
+  # follows member URLs that never connect and never opens gRPC :11800.
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    hostname: etcd
+    networks:
+      - e2e
+    command:
+      - /usr/local/bin/etcd
+      - --name=cds-etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=cds-etcd=http://etcd:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=cds-e2e
+    expose:
+      - "2379"
+    healthcheck:
+      test: [ "CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health" ]
+      interval: 5s
+      timeout: 60s
+      retries: 120
+
+  oap:
+    extends:
+      file: ../../../base/docker-compose.base.yml
+      service: oap
+    environment:
+      SW_CONFIGURATION: etcd
+      SW_CONFIG_ETCD_PERIOD: "5"
+      SW_CONFIG_ETCD_ENDPOINTS: http://etcd:2379
+      SW_CONFIGURATION_DISCOVERY: default
+    depends_on:
+      etcd:
+        condition: service_healthy
+    ports:
+      - "12800"
+
+  provider:
+    extends:
+      file: ../../../base/docker-compose.base.yml
+      service: fastapi-provider
+    environment:
+      SW_AGENT_NAME: e2e-cds-provider
+      SW_AGENT_COLLECTOR_BACKEND_SERVICES: oap:11800
+      # Bootstrap accepts every trace; CDS turns the limit on without a restart.
+      SW_SAMPLE_N_PER_3_SECS: "0"
+      SW_AGENT_COLLECTOR_GET_AGENT_DYNAMIC_CONFIG_INTERVAL: "5"
+    depends_on:
+      oap:
+        condition: service_healthy
+    ports:
+      - "9090"
+
+networks:
+  e2e:

@@ -56,6 +56,10 @@ class Protocol(ABC):
     def notify_profile_task_finish(self, task):
         raise NotImplementedError()
 
+    def sync_agent_configurations(self):
+        """gRPC CDS poll; other protocols no-op."""
+        return
+
 
 class ProtocolAsync(ABC):
     def is_ready(self) -> bool:
@@ -89,3 +93,7 @@ class ProtocolAsync(ABC):
     @abstractmethod
     async def notify_profile_task_finish(self, task):
         raise NotImplementedError()
+
+    async def sync_agent_configurations(self):
+        """gRPC CDS poll; other protocols no-op."""
+        return
