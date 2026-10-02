@@ -18,7 +18,7 @@
 """CDS watchers for the Java dynamic keys besides sampling."""
 
 from skywalking import config
-from skywalking.conf.dynamic.configuration_discovery_service import configuration_discovery_service
+from skywalking.conf.dynamic.configuration_discovery import configuration_discovery_service
 from skywalking.conf.dynamic.watcher import AgentConfigChangeWatcher, ConfigChangeEvent, EventType
 from skywalking.loggings import logger
 

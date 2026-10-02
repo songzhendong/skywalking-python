@@ -586,7 +586,7 @@ class TestAdditionalCdsKeys(unittest.TestCase):
 
     def test_unknown_oap_key_is_warned_and_ignored(self):
         register_agent_dynamic_watchers()
-        with patch('skywalking.conf.dynamic.configuration_discovery_service.logger') as mock_logger:
+        with patch('skywalking.conf.dynamic.configuration_discovery.logger') as mock_logger:
             configuration_discovery_service.handle_configuration_discovery_command(
                 ConfigurationDiscoveryCommand(
                     serial_number='sn',
@@ -638,6 +638,92 @@ class TestAdditionalCdsKeys(unittest.TestCase):
         self.assertEqual('.jpg', config.agent_ignore_suffix)
         self.assertEqual(300, config.agent_span_limit_per_segment)
         self.assertEqual(100, config.plugin_sql_parameters_max_length)
+
+
+class TestSpanReuseUnderLimit(unittest.TestCase):
+    """Entry/Exit span reuse must not be short-circuited by the span limit."""
+
+    def setUp(self):
+        self._prev = config.agent_span_limit_per_segment
+        config.agent_span_limit_per_segment = 1
+        self._clear_active_spans()
+
+    def tearDown(self):
+        self._clear_active_spans()
+        config.agent_span_limit_per_segment = self._prev
+
+    @staticmethod
+    def _clear_active_spans():
+        from skywalking.trace import context as ctx_mod
+
+        spans = ctx_mod._spans()
+        if spans is not None:
+            spans.clear()
+
+    def test_entry_span_reuse_under_limit(self):
+        from skywalking import Component
+        from skywalking.trace.context import SpanContext
+        from skywalking.trace.span import NoopSpan
+
+        with patch('skywalking.trace.context.agent.is_segment_queue_full', return_value=False), \
+                patch('skywalking.trace.context.config.agent_profile_active', False):
+            ctx = SpanContext()
+            first = ctx.new_entry_span('/a')
+            self.assertNotIsInstance(first, NoopSpan)
+            ctx.start(first)
+            # EntrySpan.start() resets component to Unknown; reuse matches inherit.
+            reused = ctx.new_entry_span('/b', inherit=Component.Unknown)
+            self.assertIs(reused, first)
+            self.assertEqual('/b', reused.op)
+            ctx.stop(first)
+
+    def test_exit_span_reuse_under_limit(self):
+        from skywalking import Component
+        from skywalking.trace.context import SpanContext
+        from skywalking.trace.span import NoopSpan
+
+        with patch('skywalking.trace.context.agent.is_segment_queue_full', return_value=False), \
+                patch('skywalking.trace.context.agent.archive_segment'):
+            ctx = SpanContext()
+            first = ctx.new_exit_span('Redis/GET', '127.0.0.1:6379', component=Component.Redis)
+            self.assertNotIsInstance(first, NoopSpan)
+            ctx.start(first)
+            first.inherit = Component.Redis
+            reused = ctx.new_exit_span(
+                'Redis/SET', '127.0.0.1:6379', component=Component.Redis, inherit=Component.Redis,
+            )
+            self.assertIs(reused, first)
+            self.assertEqual('Redis/SET', reused.op)
+            ctx.stop(first)
+
+
+class TestCdsExecutorImportOrder(unittest.TestCase):
+    """Package export must be the CDS singleton, not a shadowed submodule."""
+
+    def test_executor_resolves_service_after_sampling_import(self):
+        import skywalking.sampling.sampling_service  # noqa: F401
+        from skywalking.command.executors.configuration_discovery_command_executor import (
+            ConfigurationDiscoveryCommandExecutor,
+        )
+        from skywalking.conf.dynamic import configuration_discovery_service as cds
+        from skywalking.conf.dynamic.configuration_discovery import (
+            ConfigurationDiscoveryService,
+        )
+
+        _reset_cds()
+        SamplingService().register_cds_watcher()
+        executor = ConfigurationDiscoveryCommandExecutor()
+        ok = executor.execute(
+            ConfigurationDiscoveryCommand(
+                serial_number='sn-import',
+                uuid='u-import',
+                config=[(SAMPLE_N_PROPERTY_KEY, '3')],
+            )
+        )
+        self.assertTrue(ok)
+        self.assertIsInstance(cds, ConfigurationDiscoveryService)
+        self.assertTrue(hasattr(cds, 'handle_configuration_discovery_command'))
+        self.assertEqual('u-import', cds.peek_uuid())
 
 
 if __name__ == '__main__':

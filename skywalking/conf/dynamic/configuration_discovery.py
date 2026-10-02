@@ -17,11 +17,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-from skywalking.command.configuration_discovery_command import ConfigurationDiscoveryCommand
 from skywalking.conf.dynamic.watcher import AgentConfigChangeWatcher, ConfigChangeEvent, EventType
 from skywalking.loggings import logger
+
+if TYPE_CHECKING:
+    from skywalking.command.configuration_discovery_command import ConfigurationDiscoveryCommand
 
 # (key, value) pairs from OAP; blank value means DELETE for that registered key.
 ConfigPair = Tuple[str, str]
