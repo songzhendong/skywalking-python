@@ -16,15 +16,31 @@
 #
 
 import asyncio
+import re
 import unittest
 from concurrent import futures
 
 import grpc
 
+from skywalking import config, sampling
 from skywalking.plugins import sw_grpc
 
 
 class TestGrpcServerUnimplemented(unittest.TestCase):
+    def setUp(self):
+        # Other unit tests may import skywalking.sampling.sampling_service and
+        # shadow the package attribute with the module object.
+        self._saved_sampling = sampling.sampling_service
+        sampling.sampling_service = None
+        self._saved_grpc_ignore = config.RE_GRPC_IGNORED_METHODS
+        # Client interceptor also wraps the channel; force Noop there so this
+        # test focuses on the server continuation(None) path.
+        config.RE_GRPC_IGNORED_METHODS = re.compile(r'.*')
+
+    def tearDown(self):
+        sampling.sampling_service = self._saved_sampling
+        config.RE_GRPC_IGNORED_METHODS = self._saved_grpc_ignore
+
     def test_sync_server_unregistered_method_returns_unimplemented(self):
         """continuation() is None for unknown methods; interceptor must not AttributeError."""
         sw_grpc.install_sync()
