@@ -136,6 +136,9 @@ def install_sync() -> None:
                 handler_call_details: grpc.HandlerCallDetails,
             ) -> grpc.RpcMethodHandler:
                 next_handler = continuation(handler_call_details)
+                # gRPC returns None for unregistered methods (UNIMPLEMENTED).
+                if next_handler is None:
+                    return None
 
                 handler_factory, next_handler_method = _get_factory_and_method(next_handler)
 
@@ -330,6 +333,9 @@ def install_async() -> None:
                 handler_call_details: grpc.HandlerCallDetails,
             ) -> grpc.RpcMethodHandler:
                 next_handler = await continuation(handler_call_details)
+                # gRPC returns None for unregistered methods (UNIMPLEMENTED).
+                if next_handler is None:
+                    return None
 
                 handler_factory, next_handler_method = _get_factory_and_method(next_handler)
                 return handler_factory(
